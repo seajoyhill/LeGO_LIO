@@ -1,0 +1,6 @@
+<launch>
+  <node pkg="lego_lio"
+        type="imageProjection"
+        name="imageProjection"
+        output="screen" />
+</launch>
