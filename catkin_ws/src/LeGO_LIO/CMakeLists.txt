@@ -8,6 +8,9 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -pthread")
 
 find_package(catkin REQUIRED COMPONENTS
   message_generation
+  tf
+  nav_msgs
+  geometry_msgs
   pcl_conversions
   pcl_ros
   roscpp
@@ -39,6 +42,9 @@ catkin_package(
     roscpp
     sensor_msgs
     std_msgs
+    geometry_msgs
+    nav_msgs
+    tf
   DEPENDS PCL OpenCV
 )
 
@@ -56,5 +62,10 @@ link_directories(
 
 add_executable(imageProjection src/imageProjection.cpp)
 add_dependencies(imageProjection ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
-target_compile_options(imageProjection PRIVATE ${PCL_CFLAGS_OTHER})
+target_compile_options(imageProjection PRIVATE ${PCL_CFLAGS_OTHER} -DUSE_UNORDERED_MAP=0)
 target_link_libraries(imageProjection ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+
+add_executable(featureAssociation src/featureAssociation.cpp)
+add_dependencies(featureAssociation ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
+target_compile_options(featureAssociation PRIVATE ${PCL_CFLAGS_OTHER} -DUSE_UNORDERED_MAP=0)
+target_link_libraries(featureAssociation ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
