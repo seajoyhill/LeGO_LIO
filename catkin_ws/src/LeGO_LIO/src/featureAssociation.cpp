@@ -654,6 +654,11 @@ public:
         }
     }
 
+    // 标记两类不可靠的点，cloudNeighborPicked = 1 的点在 extractFeatures() 中会被跳过：
+    // 1) 遮挡点：深度突变的远侧边缘，激光束掠射测量，坐标不可靠（假边缘点）
+    // 2) 平行光束点：激光束几乎与表面平行，该点横向位置飘移大
+    // 标记 ±5 邻域是因为 calculateSmoothness() 的曲率窗口为前后各 5 个点，
+    // 避免坏点污染邻点的曲率计算。
     void markOccludedPoints()
     {
         int cloudSize = segmentedCloud->points.size();
@@ -662,10 +667,15 @@ public:
 
             float depth1 = segInfo.segmentedCloudRange[i];
             float depth2 = segInfo.segmentedCloudRange[i+1];
+            // 点云按列（水平角）排序，相邻索引通常对应相邻列；
+            // 列差 < 10 保证两者方位角接近，深度突变不是由列跳跃造成的
             int columnDiff = std::abs(int(segInfo.segmentedCloudColInd[i+1] - segInfo.segmentedCloudColInd[i]));
 
             if (columnDiff < 10){
 
+                // 遮挡边界检测：相邻两点深度差超过 0.3m 时，
+                // 远侧的点是激光擦过近处物体边缘斜着测到的，测距误差大，
+                // 且下一帧可能扫不到，无法稳定匹配。近侧点保留，远侧点标记。
                 if (depth1 - depth2 > 0.3){
                     cloudNeighborPicked[i - 5] = 1;
                     cloudNeighborPicked[i - 4] = 1;
@@ -686,6 +696,7 @@ public:
             float diff1 = std::abs(float(segInfo.segmentedCloudRange[i-1] - segInfo.segmentedCloudRange[i]));
             float diff2 = std::abs(float(segInfo.segmentedCloudRange[i+1] - segInfo.segmentedCloudRange[i]));
 
+            // 相对前后邻点的深度差都超过自身距离的 2% → 光束与表面近似平行
             if (diff1 > 0.02 * segInfo.segmentedCloudRange[i] && diff2 > 0.02 * segInfo.segmentedCloudRange[i])
                 cloudNeighborPicked[i] = 1;
         }
@@ -1491,7 +1502,7 @@ public:
 
         calculateSmoothness();
 
-        markOccludedPoints();
+        markOccludedPoints(); // 剔除遮挡点/平行光束点，防止被提取为特征
 
         extractFeatures();
 
