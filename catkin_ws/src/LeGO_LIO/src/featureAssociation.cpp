@@ -702,6 +702,12 @@ public:
         }
     }
 
+    // 曲率特征提取。按「扫描线(环) × 6 个子区间」划分, 每个子区间内
+    // 按曲率排序后分类挑选, 向后续链路输出四类特征点:
+    //   - cornerPointsSharp / cornerPointsLessSharp: 非地面点中的尖锐角点(点-线残差约束)
+    //   - surfPointsFlat: 地面点中最平坦的点(点-面残差约束)
+    //   - surfPointsLessFlat: 其余剩余点的降采样集合(宽松面特征池, 供点-面匹配兜底)
+    // cloudLabel 约定: 2 = 最尖锐角点, 1 = 次角点, -1 = 平坦地面点, 0 = 未标记/普通点
     void extractFeatures()
     {
         cornerPointsSharp->clear();
@@ -709,21 +715,37 @@ public:
         surfPointsFlat->clear();
         surfPointsLessFlat->clear();
 
+        // 外层: 每条扫描线(环)独立处理, 保证各环特征配额互不干扰
         for (int i = 0; i < N_SCAN; i++) {
 
+            // 每环的剩余面点先清空, 6 个子区间累计完后再统一降采样
             surfPointsLessFlatScan->clear();
 
+            // 中层: 把本环索引区间等分成 6 个子区间
             for (int j = 0; j < 6; j++) {
 
+                // 插值的是「段边界索引」, sp/ep 是第 j 个子区间的起止下标:
+                //   sp = 加权平均: S 权重 (6-j)/6, E 权重 j/6
+                //      = 线性插值 S + (E-S)*j/6, 即从 S(startRingIndex) 向
+                //        E(endRingIndex) 走 j/6 处;
+                //   ep = 把 j 换成 j+1 代入 sp 公式再减 1, 恒有 ep = sp_{j+1} - 1,
+                //       因此 6 段首尾相接、不重不漏地覆盖 [S, E-1]。
+                // 意义: 各子区间独立挑特征并配给固定名额, 使角点/面点沿
+                //       环的 360° 均匀分布, 而非全部挤在曲率最大的局部。
                 int sp = (segInfo.startRingIndex[i] * (6 - j)    + segInfo.endRingIndex[i] * j) / 6;
                 int ep = (segInfo.startRingIndex[i] * (5 - j)    + segInfo.endRingIndex[i] * (j + 1)) / 6 - 1;
 
+                // 该环有效点过少时子区间长度不足(或只剩一个点), 直接跳过
                 if (sp >= ep)
                     continue;
 
+                // by_value 按曲率值升序: 最小值在左(sp 端), 最大值在右(ep 端)
                 std::sort(cloudSmoothness.begin()+sp, cloudSmoothness.begin()+ep, by_value());
 
                 int largestPickedNum = 0;
+                // 角点候选: 未被遮挡标记、曲率足够尖锐(> edgeThreshold)且「非地面」的点。
+                // 从曲率最高端(ep)向低端扫描, 段内配额: 前 2 个标为 sharp
+                // (cloudLabel=2), 其后至多 18 个标为 less sharp(cloudLabel=1), 满 20 即止。
                 for (int k = ep; k >= sp; k--) {
                     int ind = cloudSmoothness[k].ind;
                     if (cloudNeighborPicked[ind] == 0 &&
@@ -742,6 +764,8 @@ public:
                             break;
                         }
 
+                        // 选中后把同列区(列差 ≤ 10)内的 ±5 个邻点一并标记,
+                        // 防止一条竖向边缘上的相邻特征点扎堆, 造成特征冗余
                         cloudNeighborPicked[ind] = 1;
                         for (int l = 1; l <= 5; l++) {
                             int columnDiff = std::abs(int(segInfo.segmentedCloudColInd[ind + l] - segInfo.segmentedCloudColInd[ind + l - 1]));
@@ -759,6 +783,9 @@ public:
                 }
 
                 int smallestPickedNum = 0;
+                // 面点候选: 未标记、曲率足够低(< surfThreshold)且「是地面」的点。
+                // 与角点相反, 从曲率最低端(sp)向上扫描, 每段最多取 4 个
+                // 最平坦的地面点标为 flat(cloudLabel=-1)。
                 for (int k = sp; k <= ep; k++) {
                     int ind = cloudSmoothness[k].ind;
                     if (cloudNeighborPicked[ind] == 0 &&
@@ -773,6 +800,7 @@ public:
                             break;
                         }
 
+                        // 同角点: 标记选中面点同列区 ±5 邻域, 避免平坦特征聚堆
                         cloudNeighborPicked[ind] = 1;
                         for (int l = 1; l <= 5; l++) {
 
@@ -793,6 +821,10 @@ public:
                     }
                 }
 
+                // 剩余点: cloudLabel <= 0 的全部流入该环的 lessFlat 集合——
+                // 含未选角点/面点的普通点, 也包括 cloudLabel == -1 的地面点
+                // (它们已进 surfPointsFlat, 又因 -1 <= 0 被重复计入; 原版即如此,
+                //  lessFlat 是后续点-面匹配的宽松面特征池, 重复冗余无害)。
                 for (int k = sp; k <= ep; k++) {
                     if (cloudLabel[k] <= 0) {
                         surfPointsLessFlatScan->push_back(segmentedCloud->points[k]);
@@ -800,6 +832,7 @@ public:
                 }
             }
 
+            // 剩余点数量大, 体素降采样控制特征集尺寸后, 再并入总的 lessFlat
             surfPointsLessFlatScanDS->clear();
             downSizeFilter.setInputCloud(surfPointsLessFlatScan);
             downSizeFilter.filter(*surfPointsLessFlatScanDS);
