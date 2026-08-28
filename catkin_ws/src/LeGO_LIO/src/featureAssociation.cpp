@@ -449,8 +449,13 @@ public:
         tf::quaternionMsgToTF(imuIn->orientation, orientation);
         tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
 
-        // sensor_msgs/Imu and lidar are both FLU: x forward, y left, z up.
-        // Remove gravity in the body frame without swapping any axes.
+        // 重力补偿：令 roll=\phi、pitch=\theta，g=9.81 m/s^2。
+        // rotationMatrix() 采用 R=R_z(yaw)R_y(pitch)R_x(roll)，将机体系向量映射到世界系。
+        // 世界系重力为 g_w=[0, 0, -g]^T，因此机体系中的重力为：
+        //   g_b = R^T g_w
+        //       = [-g sin(theta), g sin(phi) cos(theta), -g cos(phi) cos(theta)]^T
+        // sensor_msgs/Imu::linear_acceleration 在此按比力 f_b=a_b-g_b 解释，
+        // 非重力线加速度由 a_b=f_b+g_b 得到。由于 g_w 沿世界系 z 轴，yaw 不出现在该式中。
         const float accX = imuIn->linear_acceleration.x + std::sin(pitch) * 9.81f;
         const float accY = imuIn->linear_acceleration.y -
                            std::sin(roll) * std::cos(pitch) * 9.81f;
