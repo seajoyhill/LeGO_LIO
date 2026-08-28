@@ -33,6 +33,7 @@
 //      IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS). October 2018.
 
 #include "utility.h"
+#include <Eigen/Geometry>
 
 class ImageProjection{
 private:
@@ -71,6 +72,10 @@ private:
     float startOrientation;
     float endOrientation;
 
+    // Transform from the lidar frame (rslidar) to the IMU/body frame
+    // (base_link). Translation is in metres and RPY is in radians.
+    Eigen::Isometry3f lidarToImuTransform;
+
     lego_lio::cloud_info segMsg; // info of segmented cloud
     std_msgs::Header cloudHeader;
 
@@ -85,6 +90,9 @@ private:
 public:
     ImageProjection():
         nh("~"){
+
+        lidarToImuTransform.setIdentity();
+        loadLidarToImuExtrinsics();
 
         subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 1, &ImageProjection::cloudHandler, this);
 
@@ -160,9 +168,55 @@ public:
 
     ~ImageProjection(){}
 
+    void loadLidarToImuExtrinsics()
+    {
+        double roll = 0.0;
+        double pitch = 0.0;
+        double yaw = 0.0;
+        double x = 0.0;
+        double y = 0.0;
+        double z = 0.0;
+
+        nh.param("lidar_to_imu/angle/roll", roll, 0.0);
+        nh.param("lidar_to_imu/angle/pitch", pitch, 0.0);
+        nh.param("lidar_to_imu/angle/yaw", yaw, 0.0);
+        nh.param("lidar_to_imu/distance/x", x, 0.0);
+        nh.param("lidar_to_imu/distance/y", y, 0.0);
+        nh.param("lidar_to_imu/distance/z", z, 0.0);
+
+        lidarToImuTransform.linear() =
+            (Eigen::AngleAxisf(static_cast<float>(yaw), Eigen::Vector3f::UnitZ()) *
+             Eigen::AngleAxisf(static_cast<float>(pitch), Eigen::Vector3f::UnitY()) *
+             Eigen::AngleAxisf(static_cast<float>(roll), Eigen::Vector3f::UnitX())).toRotationMatrix();
+        lidarToImuTransform.translation() =
+            Eigen::Vector3f(static_cast<float>(x),
+                            static_cast<float>(y),
+                            static_cast<float>(z));
+
+        ROS_INFO("Loaded lidar -> IMU extrinsic from params: "
+                 "translation [%.4f, %.4f, %.4f] m, "
+                 "RPY [%.4f, %.4f, %.4f] rad",
+                 x, y, z, roll, pitch, yaw);
+    }
+
+    PointType transformLidarPointToImu(const PointType& lidarPoint) const
+    {
+        const Eigen::Vector3f pointInLidar(
+            lidarPoint.x, lidarPoint.y, lidarPoint.z);
+        const Eigen::Vector3f pointInImu = lidarToImuTransform * pointInLidar;
+
+        PointType imuPoint = lidarPoint;
+        imuPoint.x = pointInImu.x();
+        imuPoint.y = pointInImu.y();
+        imuPoint.z = pointInImu.z();
+        return imuPoint;
+    }
+
     void copyPointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
         cloudHeader = laserCloudMsg->header;
+        // The points are transformed below into the IMU/body frame.
+        cloudHeader.frame_id = "base_link";
 
         if (useCloudRing)
         {
@@ -194,6 +248,7 @@ public:
                 point.y = ringPoint.y;
                 point.z = ringPoint.z;
                 point.intensity = ringPoint.intensity;
+                point = transformLidarPointToImu(point);
                 laserCloudIn->push_back(point);
                 ++validPointCount;
             }
@@ -214,6 +269,8 @@ public:
         else
         {
             pcl::fromROSMsg(*laserCloudMsg, *laserCloudIn);
+            for (PointType& point : laserCloudIn->points)
+                point = transformLidarPointToImu(point);
 
             const size_t originalPointCount = laserCloudIn->size();
             size_t validPointCount = 0;

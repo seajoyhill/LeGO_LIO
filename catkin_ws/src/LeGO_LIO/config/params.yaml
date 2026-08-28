@@ -1,1 +1,13 @@
-# LeGO_LIO currently keeps sensor/model parameters in include/utility.h.
+# Lidar-to-IMU extrinsic calibration used by imageProjection.
+# The transform is applied as: p_imu = R_lidar_to_imu * p_lidar + t_lidar_to_imu.
+# Angles use ROS RPY order (roll, pitch, yaw) and are expressed in radians.
+# Distances are expressed in metres.
+lidar_to_imu:
+  angle:
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  distance:
+    x: 0.35
+    y: 0.0
+    z: 0.20
