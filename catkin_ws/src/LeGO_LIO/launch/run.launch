@@ -1,10 +1,31 @@
 <launch>
+  <param name="/use_sim_time" value="true" />
   <node pkg="lego_lio"
         type="imageProjection"
         name="imageProjection"
-        output="screen" />
+        output="screen">
+    <rosparam command="load" file="$(find lego_lio)/config/params.yaml" />
+  </node>
   <node pkg="lego_lio"
         type="featureAssociation"
         name="featureAssociation"
         output="screen" />
+
+  <!-- Temporary identity transform: map -> odom -->
+  <node pkg="tf"
+        type="static_transform_publisher"
+        name="map_to_odom"
+        args="0 0 0 0 0 0 map odom 100" />
+  <!-- LiDAR mounting pose: configured in config/params.yaml -->
+  <node pkg="tf"
+        type="static_transform_publisher"
+        name="base_link_to_rslidar"
+        args="0.35 0 0.20 0 0 0 base_link rslidar 100" />
+  <node pkg="rosbag" type="play" name="rosbag_play"
+          args="&#45;&#45;clock &#45;&#45;rate=1.0 /Users/sjh/rosbags/eight.bag &#45;&#45;topics /velodyne_points /imu /odom"
+          required="false" output="log" />
+  <node pkg="rviz" type="rviz" name="rviz"
+        args="-d $(find lego_lio)/rviz/mapping.rviz"
+        required="false" output="log">
+  </node>
 </launch>

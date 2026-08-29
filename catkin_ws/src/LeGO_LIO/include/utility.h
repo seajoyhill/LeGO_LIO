@@ -59,7 +59,7 @@ using namespace std;
 typedef pcl::PointXYZI PointType;
 
 static const string pointCloudTopic = "/velodyne_points";
-static const string imuTopic = "/imu/data";
+static const string imuTopic = "/imu";
 static const string fileDirectory = "/tmp/";
 constexpr bool useCloudRing = true;
 
