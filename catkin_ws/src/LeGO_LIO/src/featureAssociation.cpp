@@ -354,6 +354,76 @@ public:
         return rotation.transpose() * (p - translation);
     }
 
+    Eigen::Matrix<float, 1, 6> computeResidualJacobianWrtRelativeMotion(
+        const PointType& point,
+        const PointType& residualCoefficient,
+        const float relativeMotion[6]) const
+    {
+        // The input point has already been deskewed by adjustDistortion().
+        // As in the original LeGO-LOAM Jacobian, differentiate the pose
+        // transform itself, without introducing the point-time factor s here.
+        // In FLU, R = Rz(yaw) * Ry(pitch) * Rx(roll), hence
+        // p_start = Rx(-roll) * Ry(-pitch) * Rz(-yaw) * (p - t).
+        const float roll = relativeMotion[0];
+        const float pitch = relativeMotion[1];
+        const float yaw = relativeMotion[2];
+        const float cr = std::cos(roll);
+        const float sr = std::sin(roll);
+        const float cp = std::cos(pitch);
+        const float sp = std::sin(pitch);
+        const float cy = std::cos(yaw);
+        const float sy = std::sin(yaw);
+
+        Eigen::Matrix3f rxInv;
+        rxInv << 1.0f, 0.0f, 0.0f,
+                 0.0f, cr, sr,
+                 0.0f, -sr, cr;
+        Eigen::Matrix3f ryInv;
+        ryInv << cp, 0.0f, -sp,
+                 0.0f, 1.0f, 0.0f,
+                 sp, 0.0f, cp;
+        Eigen::Matrix3f rzInv;
+        rzInv << cy, sy, 0.0f,
+                 -sy, cy, 0.0f,
+                 0.0f, 0.0f, 1.0f;
+
+        Eigen::Matrix3f drxInv;
+        drxInv << 0.0f, 0.0f, 0.0f,
+                  0.0f, -sr, cr,
+                  0.0f, -cr, -sr;
+        Eigen::Matrix3f dryInv;
+        dryInv << -sp, 0.0f, -cp,
+                  0.0f, 0.0f, 0.0f,
+                  cp, 0.0f, -sp;
+        Eigen::Matrix3f drzInv;
+        drzInv << -sy, cy, 0.0f,
+                  -cy, -sy, 0.0f,
+                  0.0f, 0.0f, 0.0f;
+
+        const Eigen::Matrix3f rotationInv = rxInv * ryInv * rzInv;
+        const Eigen::Vector3f pMinusT(
+            point.x - relativeMotion[3],
+            point.y - relativeMotion[4],
+            point.z - relativeMotion[5]);
+
+        Eigen::Matrix<float, 3, 6> pointJacobian;
+        pointJacobian.col(0) = drxInv * ryInv * rzInv * pMinusT;
+        pointJacobian.col(1) = rxInv * dryInv * rzInv * pMinusT;
+        pointJacobian.col(2) = rxInv * ryInv * drzInv * pMinusT;
+        pointJacobian.col(3) = -rotationInv.col(0);
+        pointJacobian.col(4) = -rotationInv.col(1);
+        pointJacobian.col(5) = -rotationInv.col(2);
+
+        Eigen::Matrix<float, 1, 6> residualJacobian;
+        for (int column = 0; column < 6; ++column) {
+            residualJacobian(0, column) =
+                residualCoefficient.x * pointJacobian(0, column) +
+                residualCoefficient.y * pointJacobian(1, column) +
+                residualCoefficient.z * pointJacobian(2, column);
+        }
+        return residualJacobian;
+    }
+
     void updateImuRollPitchYawStartSinCos()
     {
         // Kept for source compatibility with the original call sites. All new
@@ -627,6 +697,7 @@ public:
 
                     updateImuRollPitchYawStartSinCos();
                 } else {
+                    // ShiftToStartIMU(pointTime); // 加了这个之后地图容易朝z轴负方向漂移
                     VeloToStartIMU();
                     TransformToStartIMU(&point);
                 }
@@ -995,7 +1066,7 @@ public:
         for (int i = 0; i < cornerPointsSharpNum; i++) {
 
             TransformToStart(&cornerPointsSharp->points[i], &pointSel);
-
+            // pointSel = cornerPointsSharp->points[i];
             if (iterCount % 5 == 0) {
 
                 kdtreeCornerLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
@@ -1106,7 +1177,7 @@ public:
         for (int i = 0; i < surfPointsFlatNum; i++) {
 
             TransformToStart(&surfPointsFlat->points[i], &pointSel);
-
+            // pointSel = surfPointsFlat->points[i];
             if (iterCount % 5 == 0) {
 
                 kdtreeSurfLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
@@ -1214,8 +1285,9 @@ public:
         }
     }
 
-    bool solveTransformationNumerically(const std::vector<int>& variableIndices,
-                                        int iterCount)
+    bool solveRelativeMotionTransform(
+        const std::vector<int>& variableIndices,
+        int iterCount)
     {
         const int pointSelNum = static_cast<int>(laserCloudOri->points.size());
         const int variableCount = static_cast<int>(variableIndices.size());
@@ -1225,24 +1297,13 @@ public:
         for (int i = 0; i < pointSelNum; ++i) {
             const PointType& point = laserCloudOri->points[i];
             const PointType& coefficient = coeffSel->points[i];
+            const Eigen::Matrix<float, 1, 6> residualJacobian =
+                computeResidualJacobianWrtRelativeMotion(
+                    point, coefficient, transformCur);
 
             for (int j = 0; j < variableCount; ++j) {
-                const int variableIndex = variableIndices[j];
-                const float epsilon = variableIndex < 3 ? 1e-4f : 1e-3f;
-                float transformPlus[6];
-                float transformMinus[6];
-                std::copy(transformCur, transformCur + 6, transformPlus);
-                std::copy(transformCur, transformCur + 6, transformMinus);
-                transformPlus[variableIndex] += epsilon;
-                transformMinus[variableIndex] -= epsilon;
-
-                const Eigen::Vector3f pointPlus = transformPointToStart(point, transformPlus);
-                const Eigen::Vector3f pointMinus = transformPointToStart(point, transformMinus);
-                const Eigen::Vector3f derivative =
-                    (pointPlus - pointMinus) / (2.0f * epsilon);
-                matA.at<float>(i, j) = coefficient.x * derivative.x() +
-                                       coefficient.y * derivative.y() +
-                                       coefficient.z * derivative.z();
+                matA.at<float>(i, j) =
+                    residualJacobian(0, variableIndices[j]);
             }
             matB.at<float>(i, 0) = -0.05f * coefficient.intensity;
         }
@@ -1297,18 +1358,18 @@ public:
     bool calculateTransformationSurf(int iterCount)
     {
         // Ground/surface constraints primarily observe roll, pitch and z in FLU.
-        return solveTransformationNumerically({0, 1, 5}, iterCount);
+        return solveRelativeMotionTransform({0, 1, 5}, iterCount);
     }
 
     bool calculateTransformationCorner(int iterCount)
     {
         // Edge constraints primarily observe yaw and horizontal translation in FLU.
-        return solveTransformationNumerically({2, 3, 4}, iterCount);
+        return solveRelativeMotionTransform({2, 3, 4}, iterCount);
     }
 
     bool calculateTransformation(int iterCount)
     {
-        return solveTransformationNumerically({0, 1, 2, 3, 4, 5}, iterCount);
+        return solveRelativeMotionTransform({0, 1, 2, 3, 4, 5}, iterCount);
     }
 
     void checkSystemInitialization(){
@@ -1339,6 +1400,7 @@ public:
         laserCloudSurfLast2.header.frame_id = "base_link";
         pubLaserCloudSurfLast.publish(laserCloudSurfLast2);
 
+        // yaw 通常没有绝对参考，初始值设为 0 是合理的；位置原点也可以任意选择。
         transformSum[0] += imuRollStart;
         transformSum[1] += imuPitchStart;
 
