@@ -35,8 +35,18 @@
 #include "utility.h"
 
 #include <Eigen/Geometry>
+#include <pcl/io/pcd_io.h>
 
 #include <set>
+#include <sstream>
+
+namespace
+{
+// 1-based frame counter for synchronized segmented_cloud/segmented_cloud_info/
+// outlier_cloud triplets. Add frame IDs here when another frame is needed.
+const std::set<int> kDebugPcdFrameIds = {175,176,177,200,201};
+const char *const kDebugPcdDirectory = "/tmp/";
+}
 
 class FeatureAssociation{
 
@@ -189,6 +199,7 @@ private:
     cv::Mat matP;
 
     int frameCount;
+    int deskewFrameCounter;
 
 public:
 
@@ -327,6 +338,7 @@ public:
         matP = cv::Mat(6, 6, CV_32F, cv::Scalar::all(0));
 
         frameCount = skipFrameNum;
+        deskewFrameCounter = 0;
     }
 
     Eigen::Matrix3f rotationMatrix(float roll, float pitch, float yaw) const
@@ -591,6 +603,44 @@ public:
         timeNewSegmentedCloudInfo = msgIn->header.stamp.toSec();
         segInfo = *msgIn;
         newSegmentedCloudInfo = true;
+    }
+
+    void saveDeskewDebugClouds(
+        int frameId,
+        const pcl::PointCloud<PointType>& rawCloud,
+        const pcl::PointCloud<PointType>& deskewedCloud)
+    {
+        if (kDebugPcdFrameIds.find(frameId) == kDebugPcdFrameIds.end())
+            return;
+
+        std::ostringstream rawPath;
+        rawPath << kDebugPcdDirectory
+                << "lego_lio_deskew_frame_" << std::setfill('0') << std::setw(6)
+                << frameId << "_raw.pcd";
+
+        std::ostringstream deskewedPath;
+        deskewedPath << kDebugPcdDirectory
+                     << "lego_lio_deskew_frame_" << std::setfill('0') << std::setw(6)
+                     << frameId << "_deskewed.pcd";
+
+        const int rawResult = pcl::io::savePCDFileBinary(rawPath.str(), rawCloud);
+        const int deskewedResult =
+            pcl::io::savePCDFileBinary(deskewedPath.str(), deskewedCloud);
+
+        if (rawResult == 0 && deskewedResult == 0)
+        {
+            ROS_INFO(
+                "[DeskewPCD] frame=%d saved raw=%s (%zu points), deskewed=%s (%zu points)",
+                frameId, rawPath.str().c_str(), rawCloud.points.size(),
+                deskewedPath.str().c_str(), deskewedCloud.points.size());
+        }
+        else
+        {
+            ROS_ERROR(
+                "[DeskewPCD] frame=%d failed to save PCD files: raw_result=%d, "
+                "deskewed_result=%d",
+                frameId, rawResult, deskewedResult);
+        }
     }
 
     void adjustDistortion()
@@ -1703,7 +1753,10 @@ public:
         /**
         	1. Feature Extraction
         */
+        ++deskewFrameCounter;
+        const pcl::PointCloud<PointType> rawSegmentedCloud = *segmentedCloud;
         adjustDistortion();
+        saveDeskewDebugClouds(deskewFrameCounter, rawSegmentedCloud, *segmentedCloud);
 
         calculateSmoothness();
 
