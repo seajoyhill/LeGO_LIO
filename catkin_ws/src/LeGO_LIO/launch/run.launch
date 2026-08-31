@@ -13,6 +13,14 @@
     <param name="debug_deskew" value="false" />
   </node>
 
+
+  <node pkg="lego_lio"
+        type="mapOptimization"
+        name="mapOptimization"
+        output="screen">
+    <rosparam command="load" file="$(find lego_lio)/config/params.yaml" />
+  </node>
+
   <!-- Temporary identity transform: map -> odom -->
   <node pkg="tf"
         type="static_transform_publisher"

@@ -15,3 +15,10 @@ lidar_to_imu:
     x: 0.27
     y: 0.0
     z: 0.20
+
+# Local scan-to-map mapping and keyframe settings.
+mappingProcessInterval: 0.3
+surroundingKeyframeSearchRadius: 50.0
+mappingCornerLeafSize: 0.2
+mappingSurfLeafSize: 0.4
+mappingOutlierLeafSize: 0.4

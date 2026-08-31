@@ -21,6 +21,8 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(OpenCV REQUIRED QUIET)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCL REQUIRED pcl_common pcl_filters pcl_io)
+find_package(Boost REQUIRED COMPONENTS serialization system filesystem thread date_time timer chrono)
+find_package(GTSAM REQUIRED QUIET)
 
 add_message_files(
   DIRECTORY msg
@@ -53,11 +55,15 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
+  ${GTSAM_INCLUDE_DIR}
+  ${GTSAM_DIR}
+  ${Boost_INCLUDE_DIRS}
 )
 
 link_directories(
   ${PCL_LIBRARY_DIRS}
   ${OpenCV_LIBRARY_DIRS}
+  ${GTSAM_LIBRARY_DIRS}
 )
 
 add_executable(imageProjection src/imageProjection.cpp)
@@ -69,3 +75,7 @@ add_executable(featureAssociation src/featureAssociation.cpp)
 add_dependencies(featureAssociation ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(featureAssociation PRIVATE ${PCL_CFLAGS_OTHER} -DUSE_UNORDERED_MAP=0)
 target_link_libraries(featureAssociation ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+
+add_executable(mapOptimization src/mapOptimization.cpp)
+add_dependencies(mapOptimization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
+target_link_libraries(mapOptimization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam ${Boost_LIBRARIES})
