@@ -36,6 +36,8 @@
 
 #include <Eigen/Geometry>
 
+#include <set>
+
 class FeatureAssociation{
 
 private:
@@ -88,6 +90,11 @@ private:
     int imuPointerFront;
     int imuPointerLast;
     int imuPointerLastIteration;
+    int imuMessageCount;
+
+    // Per-frame IMU deskew diagnostics. Enabled by default; set the private
+    // ROS parameter ~debug_deskew to false to disable the per-frame summary.
+    bool debugDeskew;
 
     float imuRollStart, imuPitchStart, imuYawStart;
     float cosImuRollStart, cosImuPitchStart, cosImuYawStart, sinImuRollStart, sinImuPitchStart, sinImuYawStart;
@@ -205,6 +212,10 @@ public:
         pubLaserOdometry = nh.advertise<nav_msgs::Odometry> ("/laser_odom_to_init", 5);
         
         initializationValue();
+
+        nh.param("debug_deskew", debugDeskew, true);
+        ROS_INFO("FeatureAssociation deskew diagnostics: %s",
+                 debugDeskew ? "enabled" : "disabled");
     }
 
     void initializationValue()
@@ -252,6 +263,8 @@ public:
         imuPointerFront = 0;
         imuPointerLast = -1;
         imuPointerLastIteration = 0;
+        imuMessageCount = 0;
+        debugDeskew = true;
 
         imuRollStart = 0; imuPitchStart = 0; imuYawStart = 0;
         cosImuRollStart = 0; cosImuPitchStart = 0; cosImuYawStart = 0;
@@ -534,6 +547,8 @@ public:
                            std::cos(roll) * std::cos(pitch) * G;
 
         imuPointerLast = (imuPointerLast + 1) % imuQueLength;
+        if (imuMessageCount < imuQueLength)
+            ++imuMessageCount;
         imuTime[imuPointerLast] = imuIn->header.stamp.toSec();
         imuRoll[imuPointerLast] = roll;
         imuPitch[imuPointerLast] = pitch;
@@ -581,7 +596,40 @@ public:
     void adjustDistortion()
     {
         bool halfPassed = false;
-        int cloudSize = segmentedCloud->points.size();
+        const int cloudSize = static_cast<int>(segmentedCloud->points.size());
+
+        // These counters describe the actual IMU samples used by this lidar
+        // frame, rather than merely the number of IMU messages received while
+        // processing it. An interpolated point contributes both neighboring
+        // IMU samples to imuPointersUsed.
+        std::set<int> imuPointersUsed;
+        int pointsWithImu = 0;
+        int pointsTransformed = 0;
+        int pointsWithoutImu = 0;
+        int pointsUsingDirectImu = 0;
+        int pointsUsingInterpolatedImu = 0;
+        int pointsBeforeImuBuffer = 0;
+        int pointsAfterImuBuffer = 0;
+
+        const bool hasImu = (imuPointerLast >= 0 && imuMessageCount > 0);
+        int oldestImuPointer = -1;
+        double oldestImuTime = 0.0;
+        double newestImuTime = 0.0;
+        int imuSamplesInScan = 0;
+        if (hasImu)
+        {
+            oldestImuPointer = (imuPointerLast - imuMessageCount + 1 + imuQueLength) % imuQueLength;
+            oldestImuTime = imuTime[oldestImuPointer];
+            newestImuTime = imuTime[imuPointerLast];
+
+            const double scanEndTime = timeScanCur + scanPeriod;
+            for (int offset = 0; offset < imuMessageCount; ++offset)
+            {
+                const int pointer = (oldestImuPointer + offset) % imuQueLength;
+                if (imuTime[pointer] >= timeScanCur && imuTime[pointer] <= scanEndTime)
+                    ++imuSamplesInScan;
+            }
+        }
 
         PointType point;
 
@@ -612,8 +660,14 @@ public:
             float relTime = (ori - segInfo.startOrientation) / segInfo.orientationDiff;
             point.intensity = int(segmentedCloud->points[i].intensity) + scanPeriod * relTime;
 
-            if (imuPointerLast >= 0) {
-                float pointTime = relTime * scanPeriod;
+            if (hasImu) {
+                const float pointTime = relTime * scanPeriod;
+                const double pointTimestamp = timeScanCur + pointTime;
+                if (pointTimestamp < oldestImuTime)
+                    ++pointsBeforeImuBuffer;
+                else if (pointTimestamp > newestImuTime)
+                    ++pointsAfterImuBuffer;
+
                 imuPointerFront = imuPointerLastIteration;
                 while (imuPointerFront != imuPointerLast) {
                     if (timeScanCur + pointTime < imuTime[imuPointerFront]) {
@@ -622,7 +676,9 @@ public:
                     imuPointerFront = (imuPointerFront + 1) % imuQueLength;
                 }
 
-                if (timeScanCur + pointTime > imuTime[imuPointerFront]) {
+                if (pointTimestamp > imuTime[imuPointerFront]) {
+                    imuPointersUsed.insert(imuPointerFront);
+                    ++pointsUsingDirectImu;
                     imuRollCur = imuRoll[imuPointerFront];
                     imuPitchCur = imuPitch[imuPointerFront];
                     imuYawCur = imuYaw[imuPointerFront];
@@ -636,7 +692,10 @@ public:
                     imuShiftZCur = imuShiftZ[imuPointerFront];   
                 } else {
                     int imuPointerBack = (imuPointerFront + imuQueLength - 1) % imuQueLength;
-                    float ratioFront = (timeScanCur + pointTime - imuTime[imuPointerBack]) 
+                    imuPointersUsed.insert(imuPointerFront);
+                    imuPointersUsed.insert(imuPointerBack);
+                    ++pointsUsingInterpolatedImu;
+                    float ratioFront = (pointTimestamp - imuTime[imuPointerBack])
                                                      / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
                     float ratioBack = (imuTime[imuPointerFront] - timeScanCur - pointTime) 
                                                     / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
@@ -659,6 +718,8 @@ public:
                     imuShiftYCur = imuShiftY[imuPointerFront] * ratioFront + imuShiftY[imuPointerBack] * ratioBack;
                     imuShiftZCur = imuShiftZ[imuPointerFront] * ratioFront + imuShiftZ[imuPointerBack] * ratioBack;
                 }
+
+                ++pointsWithImu;
 
                 if (i == 0) {
                     imuRollStart = imuRollCur;
@@ -701,9 +762,52 @@ public:
                     // ShiftToStartIMU(pointTime); // 加了这个之后地图容易朝z轴负方向漂移
                     VeloToStartIMU();
                     TransformToStartIMU(&point);
+                    ++pointsTransformed;
                 }
+            } else {
+                ++pointsWithoutImu;
             }
             segmentedCloud->points[i] = point;
+        }
+
+        if (debugDeskew)
+        {
+            double usedImuStartTime = 0.0;
+            double usedImuEndTime = 0.0;
+            if (!imuPointersUsed.empty())
+            {
+                usedImuStartTime = std::numeric_limits<double>::max();
+                for (std::set<int>::const_iterator it = imuPointersUsed.begin();
+                     it != imuPointersUsed.end(); ++it)
+                {
+                    usedImuStartTime = std::min(usedImuStartTime, imuTime[*it]);
+                    usedImuEndTime = std::max(usedImuEndTime, imuTime[*it]);
+                }
+            }
+
+            ROS_INFO(
+                "[Deskew] frame=%u scan=%.6f points=%d with_imu=%d transformed=%d no_imu=%d "
+                "direct_points=%d interpolated_points=%d unique_imu_used=%zu "
+                "imu_in_scan_window=%d imu_queue=%d imu_buffer=[%.6f, %.6f] "
+                "used_imu_time=[%.6f, %.6f] points_before_buffer=%d points_after_buffer=%d",
+                cloudHeader.seq, timeScanCur, cloudSize, pointsWithImu, pointsTransformed,
+                pointsWithoutImu, pointsUsingDirectImu, pointsUsingInterpolatedImu,
+                imuPointersUsed.size(), imuSamplesInScan, imuMessageCount,
+                oldestImuTime, newestImuTime, usedImuStartTime, usedImuEndTime,
+                pointsBeforeImuBuffer, pointsAfterImuBuffer);
+
+            if (!hasImu)
+            {
+                ROS_WARN("[Deskew] frame=%u has no IMU sample available; all points remain un-deskewed.",
+                         cloudHeader.seq);
+            }
+            else if (pointsWithoutImu > 0 || pointsBeforeImuBuffer > 0 || pointsAfterImuBuffer > 0)
+            {
+                ROS_WARN(
+                    "[Deskew] frame=%u IMU coverage does not fully cover the lidar frame "
+                    "(no_imu=%d, before_buffer=%d, after_buffer=%d).",
+                    cloudHeader.seq, pointsWithoutImu, pointsBeforeImuBuffer, pointsAfterImuBuffer);
+            }
         }
 
         imuPointerLastIteration = imuPointerLast;
