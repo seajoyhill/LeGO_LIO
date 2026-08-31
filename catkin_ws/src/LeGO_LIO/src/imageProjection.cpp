@@ -52,20 +52,11 @@ public:
     virtual bool process(const sensor_msgs::PointCloud2ConstPtr& msg,
                          pcl::PointCloud<PointType>& cloud,
                          pcl::PointCloud<PointXYZIR>& cloudWithRing,
-                         std_msgs::Header& outputHeader) = 0;
+                         std_msgs::Header& outputHeader,
+                         std::vector<double>& pointTimestamps,
+                         bool& hasPointTimestamp) = 0;
     virtual bool hasRing() const = 0;
     virtual std::string name() const = 0;
-
-    // Return the timestamp of the first point in the packet when the lidar
-    // provides a per-point absolute timestamp. If unavailable, callers keep
-    // using the PointCloud2 header timestamp.
-    virtual bool firstPointTimestamp(const sensor_msgs::PointCloud2& msg,
-                                     ros::Time& timestamp) const
-    {
-        (void)msg;
-        (void)timestamp;
-        return false;
-    }
 };
 
 class Rb32Handler : public LidarHandler
@@ -74,30 +65,30 @@ public:
     bool process(const sensor_msgs::PointCloud2ConstPtr& msg,
                  pcl::PointCloud<PointType>& cloud,
                  pcl::PointCloud<PointXYZIR>& cloudWithRing,
-                 std_msgs::Header& outputHeader) override
+                 std_msgs::Header& outputHeader,
+                 std::vector<double>& pointTimestamps,
+                 bool& hasPointTimestamp) override
     {
         cloud.clear();
         cloudWithRing.clear();
+        pointTimestamps.clear();
+        hasPointTimestamp = false;
         outputHeader = msg->header;
 
         // This is specific to this Robosense packet format: the packet header
         // carries the timestamp of the last point, while the scan start needed
         // by LeGO-LOAM is stored in the first point's absolute timestamp.
+        std::vector<double> inputPointTimestamps;
         ros::Time firstPointTime;
-        if (firstPointTimestamp(*msg, firstPointTime))
+        if (readPointTimestamps(*msg, inputPointTimestamps, firstPointTime))
         {
-            const double packetHeaderTime = outputHeader.stamp.toSec();
             outputHeader.stamp = firstPointTime;
-            // ROS_INFO_THROTTLE(5.0,
-            //                   "Using first Robosense point timestamp as scan timestamp: "
-            //                   "first=%.9f, packet_header=%.9f, shift=%.6f s",
-            //                   outputHeader.stamp.toSec(), packetHeaderTime,
-            //                   packetHeaderTime - outputHeader.stamp.toSec());
+            hasPointTimestamp = true;
         }
         else
         {
             ROS_WARN_THROTTLE(5.0,
-                              "No valid first-point timestamp found in the Robosense cloud; "
+                              "No valid Robosense point timestamps found; "
                               "using packet header timestamp %.9f.",
                               outputHeader.stamp.toSec());
         }
@@ -141,6 +132,8 @@ public:
             point.z = ringPoint.z;
             point.intensity = ringPoint.intensity;
             cloud.push_back(point);
+            if (hasPointTimestamp)
+                pointTimestamps.push_back(inputPointTimestamps[i]);
             ++validPointCount;
         }
 
@@ -173,9 +166,11 @@ public:
         return "robosense32";
     }
 
-    bool firstPointTimestamp(const sensor_msgs::PointCloud2& msg,
-                             ros::Time& timestamp) const override
+    bool readPointTimestamps(const sensor_msgs::PointCloud2& msg,
+                             std::vector<double>& timestamps,
+                             ros::Time& firstTimestamp) const
     {
+        timestamps.clear();
         if (msg.width == 0 || msg.height == 0)
             return false;
 
@@ -194,40 +189,49 @@ public:
 
         try
         {
-            double firstTimestamp = 0.0;
+            const size_t pointCount = static_cast<size_t>(msg.width) * msg.height;
+            timestamps.reserve(pointCount);
             if (timestampField->datatype == sensor_msgs::PointField::FLOAT64)
             {
-                sensor_msgs::PointCloud2ConstIterator<double> timestampIterator(msg, "timestamp");
-                firstTimestamp = *timestampIterator;
+                sensor_msgs::PointCloud2ConstIterator<double> iterator(msg, "timestamp");
+                for (size_t i = 0; i < pointCount; ++i, ++iterator)
+                    timestamps.push_back(*iterator);
             }
             else if (timestampField->datatype == sensor_msgs::PointField::FLOAT32)
             {
-                sensor_msgs::PointCloud2ConstIterator<float> timestampIterator(msg, "timestamp");
-                firstTimestamp = *timestampIterator;
+                sensor_msgs::PointCloud2ConstIterator<float> iterator(msg, "timestamp");
+                for (size_t i = 0; i < pointCount; ++i, ++iterator)
+                    timestamps.push_back(*iterator);
             }
             else
             {
                 ROS_WARN_THROTTLE(5.0,
-                                  "Robosense point field 'timestamp' has unsupported datatype %u; "
-                                  "using the PointCloud2 header timestamp.",
+                                  "Robosense point field 'timestamp' has unsupported datatype %u.",
                                   timestampField->datatype);
+                timestamps.clear();
                 return false;
             }
 
-            if (!std::isfinite(firstTimestamp))
+            if (timestamps.empty() || !std::isfinite(timestamps.front()))
+            {
+                timestamps.clear();
                 return false;
+            }
 
-            timestamp.fromSec(firstTimestamp);
+            firstTimestamp.fromSec(timestamps.front());
             return true;
         }
         catch (const std::exception& exception)
         {
             ROS_WARN_THROTTLE(5.0,
-                              "Failed to read the first Robosense point timestamp: %s",
+                              "Failed to read Robosense point timestamps: %s",
                               exception.what());
+            timestamps.clear();
             return false;
         }
     }
+
+
 };
 
 std::unique_ptr<LidarHandler> createLidarHandler(const std::string& configuredType)
@@ -267,6 +271,9 @@ private:
 
     pcl::PointCloud<PointType>::Ptr laserCloudIn;
     pcl::PointCloud<PointXYZIR>::Ptr laserCloudInRing;
+    std::vector<double> pointTimestamps;
+    bool hasPointTimestamp;
+    std::vector<double> fullCloudTimestamp;
 
     pcl::PointCloud<PointType>::Ptr fullCloud; // projected lidar raw cloud, saved in the form of a 1-D matrix
     pcl::PointCloud<PointType>::Ptr fullInfoCloud; // same as fullCloud, but with intensity - range
@@ -342,6 +349,8 @@ public:
 
         fullCloud.reset(new pcl::PointCloud<PointType>());
         fullInfoCloud.reset(new pcl::PointCloud<PointType>());
+        fullCloudTimestamp.resize(N_SCAN * Horizon_SCAN,
+                                  std::numeric_limits<double>::quiet_NaN());
 
         groundCloud.reset(new pcl::PointCloud<PointType>());
         segmentedCloud.reset(new pcl::PointCloud<PointType>());
@@ -357,6 +366,7 @@ public:
         segMsg.segmentedCloudGroundFlag.assign(N_SCAN*Horizon_SCAN, false);
         segMsg.segmentedCloudColInd.assign(N_SCAN*Horizon_SCAN, 0);
         segMsg.segmentedCloudRange.assign(N_SCAN*Horizon_SCAN, 0);
+        segMsg.hasPointTimestamp = false;
 
         std::pair<int8_t, int8_t> neighbor;
         neighbor.first = -1; neighbor.second =  0; neighborIterator.push_back(neighbor);
@@ -377,6 +387,10 @@ public:
         segmentedCloud->clear();
         segmentedCloudPure->clear();
         outlierCloud->clear();
+        pointTimestamps.clear();
+        hasPointTimestamp = false;
+        segMsg.hasPointTimestamp = false;
+        segMsg.segmentedCloudTimestamp.clear();
 
         rangeMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_32F, cv::Scalar::all(FLT_MAX));
         groundMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_8S, cv::Scalar::all(0));
@@ -438,7 +452,7 @@ public:
         // The selected lidar handler owns lidar-specific packet conversion and
         // timestamp conventions.
         if (!lidarHandler->process(laserCloudMsg, *laserCloudIn, *laserCloudInRing,
-                                   cloudHeader))
+                                   cloudHeader, pointTimestamps, hasPointTimestamp))
         {
             ROS_WARN_THROTTLE(5.0, "Skipping point cloud because lidar processing failed.");
             return;
@@ -523,6 +537,8 @@ public:
 
             index = columnIdn  + rowIdn * Horizon_SCAN;
             fullCloud->points[index] = thisPoint;
+            if (hasPointTimestamp)
+                fullCloudTimestamp[index] = pointTimestamps[i];
             fullInfoCloud->points[index] = thisPoint;
             fullInfoCloud->points[index].intensity = range; // the corresponding range of a point is saved as "intensity"
         }
@@ -589,6 +605,8 @@ public:
                     labelComponents(i, j);
 
         int sizeOfSegCloud = 0;
+        segMsg.hasPointTimestamp = hasPointTimestamp;
+        segMsg.segmentedCloudTimestamp.clear();
         // extract segmented cloud for lidar odometry
         for (size_t i = 0; i < N_SCAN; ++i) {
 
@@ -618,6 +636,9 @@ public:
                     segMsg.segmentedCloudRange[sizeOfSegCloud]  = rangeMat.at<float>(i,j);
                     // save seg cloud
                     segmentedCloud->push_back(fullCloud->points[j + i*Horizon_SCAN]);
+                    if (hasPointTimestamp)
+                        segMsg.segmentedCloudTimestamp.push_back(
+                            fullCloudTimestamp[j + i * Horizon_SCAN]);
                     // size of seg cloud
                     ++sizeOfSegCloud;
                 }

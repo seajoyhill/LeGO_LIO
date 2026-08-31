@@ -658,10 +658,22 @@ public:
         int pointsWithoutImu = 0;
         int pointsUsingDirectImu = 0;
         int pointsUsingInterpolatedImu = 0;
+        int pointsUsingAttachedTimestamp = 0;
+        int pointsUsingAngleTimestamp = 0;
         int pointsBeforeImuBuffer = 0;
         int pointsAfterImuBuffer = 0;
 
         const bool hasImu = (imuPointerLast >= 0 && imuMessageCount > 0);
+        const bool hasAttachedPointTimestamp =
+            segInfo.hasPointTimestamp &&
+            segInfo.segmentedCloudTimestamp.size() == static_cast<size_t>(cloudSize);
+        if (segInfo.hasPointTimestamp && !hasAttachedPointTimestamp)
+        {
+            ROS_WARN_THROTTLE(5.0,
+                              "Point timestamp flag is set but timestamp count does not match "
+                              "segmented cloud size; falling back to angle-based time.");
+        }
+
         int oldestImuPointer = -1;
         double oldestImuTime = 0.0;
         double newestImuTime = 0.0;
@@ -672,7 +684,16 @@ public:
             oldestImuTime = imuTime[oldestImuPointer];
             newestImuTime = imuTime[imuPointerLast];
 
-            const double scanEndTime = timeScanCur + scanPeriod;
+            double scanEndTime = timeScanCur + scanPeriod;
+            if (hasAttachedPointTimestamp)
+            {
+                for (size_t i = 0; i < segInfo.segmentedCloudTimestamp.size(); ++i)
+                {
+                    if (std::isfinite(segInfo.segmentedCloudTimestamp[i]))
+                        scanEndTime = std::max(scanEndTime,
+                                               segInfo.segmentedCloudTimestamp[i]);
+                }
+            }
             for (int offset = 0; offset < imuMessageCount; ++offset)
             {
                 const int pointer = (oldestImuPointer + offset) % imuQueLength;
@@ -689,30 +710,50 @@ public:
             // x forward, y left, z up.
             point = segmentedCloud->points[i];
 
-            float ori = -atan2(point.y, point.x);
-            if (!halfPassed) {
-                if (ori < segInfo.startOrientation - M_PI / 2)
-                    ori += 2 * M_PI;
-                else if (ori > segInfo.startOrientation + M_PI * 3 / 2)
-                    ori -= 2 * M_PI;
+            float pointTime = 0.0f;
+            double pointTimestamp = timeScanCur;
+            const bool useAttachedPointTimestamp =
+                hasAttachedPointTimestamp &&
+                std::isfinite(segInfo.segmentedCloudTimestamp[i]);
 
-                if (ori - segInfo.startOrientation > M_PI)
-                    halfPassed = true;
-            } else {
-                ori += 2 * M_PI;
+            if (useAttachedPointTimestamp)
+            {
+                pointTimestamp = segInfo.segmentedCloudTimestamp[i];
+                pointTime = static_cast<float>(pointTimestamp - timeScanCur);
+                ++pointsUsingAttachedTimestamp;
+            }
+            else
+            {
+                ++pointsUsingAngleTimestamp;
+                float ori = -atan2(point.y, point.x);
+                if (!halfPassed) {
+                    if (ori < segInfo.startOrientation - M_PI / 2)
+                        ori += 2 * M_PI;
+                    else if (ori > segInfo.startOrientation + M_PI * 3 / 2)
+                        ori -= 2 * M_PI;
 
-                if (ori < segInfo.endOrientation - M_PI * 3 / 2)
+                    if (ori - segInfo.startOrientation > M_PI)
+                        halfPassed = true;
+                } else {
                     ori += 2 * M_PI;
-                else if (ori > segInfo.endOrientation + M_PI / 2)
-                    ori -= 2 * M_PI;
+
+                    if (ori < segInfo.endOrientation - M_PI * 3 / 2)
+                        ori += 2 * M_PI;
+                    else if (ori > segInfo.endOrientation + M_PI / 2)
+                        ori -= 2 * M_PI;
+                }
+
+                const float relTime =
+                    (ori - segInfo.startOrientation) / segInfo.orientationDiff;
+                pointTime = relTime * scanPeriod;
+                pointTimestamp = timeScanCur + pointTime;
             }
 
-            float relTime = (ori - segInfo.startOrientation) / segInfo.orientationDiff;
-            point.intensity = int(segmentedCloud->points[i].intensity) + scanPeriod * relTime;
+            // Keep ring in the integer part and the point's relative time in
+            // seconds in the fractional part for later scan registration.
+            point.intensity = int(segmentedCloud->points[i].intensity) + pointTime;
 
             if (hasImu) {
-                const float pointTime = relTime * scanPeriod;
-                const double pointTimestamp = timeScanCur + pointTime;
                 if (pointTimestamp < oldestImuTime)
                     ++pointsBeforeImuBuffer;
                 else if (pointTimestamp > newestImuTime)
@@ -720,7 +761,7 @@ public:
 
                 imuPointerFront = imuPointerLastIteration;
                 while (imuPointerFront != imuPointerLast) {
-                    if (timeScanCur + pointTime < imuTime[imuPointerFront]) {
+                    if (pointTimestamp < imuTime[imuPointerFront]) {
                         break;
                     }
                     imuPointerFront = (imuPointerFront + 1) % imuQueLength;
@@ -747,7 +788,7 @@ public:
                     ++pointsUsingInterpolatedImu;
                     float ratioFront = (pointTimestamp - imuTime[imuPointerBack])
                                                      / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
-                    float ratioBack = (imuTime[imuPointerFront] - timeScanCur - pointTime) 
+                    float ratioBack = (imuTime[imuPointerFront] - pointTimestamp) 
                                                     / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
 
                     imuRollCur = imuRoll[imuPointerFront] * ratioFront + imuRoll[imuPointerBack] * ratioBack;
@@ -784,15 +825,15 @@ public:
                     imuShiftYStart = imuShiftYCur;
                     imuShiftZStart = imuShiftZCur;
 
-                    if (timeScanCur + pointTime > imuTime[imuPointerFront]) {
+                    if (pointTimestamp > imuTime[imuPointerFront]) {
                         imuAngularRotationXCur = imuAngularRotationX[imuPointerFront];
                         imuAngularRotationYCur = imuAngularRotationY[imuPointerFront];
                         imuAngularRotationZCur = imuAngularRotationZ[imuPointerFront];
                     }else{
                         int imuPointerBack = (imuPointerFront + imuQueLength - 1) % imuQueLength;
-                        float ratioFront = (timeScanCur + pointTime - imuTime[imuPointerBack]) 
+                        float ratioFront = (pointTimestamp - imuTime[imuPointerBack])
                                                          / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
-                        float ratioBack = (imuTime[imuPointerFront] - timeScanCur - pointTime) 
+                        float ratioBack = (imuTime[imuPointerFront] - pointTimestamp) 
                                                         / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
                         imuAngularRotationXCur = imuAngularRotationX[imuPointerFront] * ratioFront + imuAngularRotationX[imuPointerBack] * ratioBack;
                         imuAngularRotationYCur = imuAngularRotationY[imuPointerFront] * ratioFront + imuAngularRotationY[imuPointerBack] * ratioBack;
@@ -837,11 +878,13 @@ public:
 
             ROS_INFO(
                 "[Deskew] frame=%u scan=%.6f points=%d with_imu=%d transformed=%d no_imu=%d "
-                "direct_points=%d interpolated_points=%d unique_imu_used=%zu "
+                "direct_points=%d interpolated_points=%d attached_time_points=%d "
+                "angle_time_points=%d unique_imu_used=%zu "
                 "imu_in_scan_window=%d imu_queue=%d imu_buffer=[%.6f, %.6f] "
                 "used_imu_time=[%.6f, %.6f] points_before_buffer=%d points_after_buffer=%d",
                 cloudHeader.seq, timeScanCur, cloudSize, pointsWithImu, pointsTransformed,
                 pointsWithoutImu, pointsUsingDirectImu, pointsUsingInterpolatedImu,
+                pointsUsingAttachedTimestamp, pointsUsingAngleTimestamp,
                 imuPointersUsed.size(), imuSamplesInScan, imuMessageCount,
                 oldestImuTime, newestImuTime, usedImuStartTime, usedImuEndTime,
                 pointsBeforeImuBuffer, pointsAfterImuBuffer);
