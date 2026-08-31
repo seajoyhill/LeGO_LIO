@@ -35,6 +35,217 @@
 #include "utility.h"
 #include <Eigen/Geometry>
 
+#include <cctype>
+#include <memory>
+#include <sensor_msgs/point_cloud2_iterator.h>
+#include <stdexcept>
+
+// Lidar-specific input conversion is kept out of the projection algorithm.
+// A handler converts the driver message into the common XYZI representation and
+// optionally provides a ring for every valid point. New lidar models can be
+// supported by adding another handler and registering it in createLidarHandler().
+class LidarHandler
+{
+public:
+    virtual ~LidarHandler() {}
+
+    virtual bool process(const sensor_msgs::PointCloud2ConstPtr& msg,
+                         pcl::PointCloud<PointType>& cloud,
+                         pcl::PointCloud<PointXYZIR>& cloudWithRing,
+                         std_msgs::Header& outputHeader) = 0;
+    virtual bool hasRing() const = 0;
+    virtual std::string name() const = 0;
+
+    // Return the timestamp of the first point in the packet when the lidar
+    // provides a per-point absolute timestamp. If unavailable, callers keep
+    // using the PointCloud2 header timestamp.
+    virtual bool firstPointTimestamp(const sensor_msgs::PointCloud2& msg,
+                                     ros::Time& timestamp) const
+    {
+        (void)msg;
+        (void)timestamp;
+        return false;
+    }
+};
+
+class Rb32Handler : public LidarHandler
+{
+public:
+    bool process(const sensor_msgs::PointCloud2ConstPtr& msg,
+                 pcl::PointCloud<PointType>& cloud,
+                 pcl::PointCloud<PointXYZIR>& cloudWithRing,
+                 std_msgs::Header& outputHeader) override
+    {
+        cloud.clear();
+        cloudWithRing.clear();
+        outputHeader = msg->header;
+
+        // This is specific to this Robosense packet format: the packet header
+        // carries the timestamp of the last point, while the scan start needed
+        // by LeGO-LOAM is stored in the first point's absolute timestamp.
+        ros::Time firstPointTime;
+        if (firstPointTimestamp(*msg, firstPointTime))
+        {
+            const double packetHeaderTime = outputHeader.stamp.toSec();
+            outputHeader.stamp = firstPointTime;
+            // ROS_INFO_THROTTLE(5.0,
+            //                   "Using first Robosense point timestamp as scan timestamp: "
+            //                   "first=%.9f, packet_header=%.9f, shift=%.6f s",
+            //                   outputHeader.stamp.toSec(), packetHeaderTime,
+            //                   packetHeaderTime - outputHeader.stamp.toSec());
+        }
+        else
+        {
+            ROS_WARN_THROTTLE(5.0,
+                              "No valid first-point timestamp found in the Robosense cloud; "
+                              "using packet header timestamp %.9f.",
+                              outputHeader.stamp.toSec());
+        }
+
+        try
+        {
+            pcl::fromROSMsg(*msg, cloudWithRing);
+        }
+        catch (const std::exception& exception)
+        {
+            ROS_ERROR_THROTTLE(5.0,
+                               "Failed to convert Robosense32 point cloud: %s",
+                               exception.what());
+            return false;
+        }
+
+        cloud.header = cloudWithRing.header;
+        cloud.sensor_origin_ = cloudWithRing.sensor_origin_;
+        cloud.sensor_orientation_ = cloudWithRing.sensor_orientation_;
+        cloud.reserve(cloudWithRing.size());
+
+        const size_t originalPointCount = cloudWithRing.size();
+        size_t validPointCount = 0;
+        for (size_t i = 0; i < originalPointCount; ++i)
+        {
+            const PointXYZIR& ringPoint = cloudWithRing.points[i];
+            if (!std::isfinite(ringPoint.x) || !std::isfinite(ringPoint.y) ||
+                !std::isfinite(ringPoint.z))
+                continue;
+
+            // A ring outside the configured scan count cannot be projected.
+            if (ringPoint.ring >= N_SCAN)
+                continue;
+
+            if (validPointCount != i)
+                cloudWithRing.points[validPointCount] = ringPoint;
+
+            PointType point{};
+            point.x = ringPoint.x;
+            point.y = ringPoint.y;
+            point.z = ringPoint.z;
+            point.intensity = ringPoint.intensity;
+            cloud.push_back(point);
+            ++validPointCount;
+        }
+
+        cloudWithRing.points.resize(validPointCount);
+        cloudWithRing.width = validPointCount;
+        cloudWithRing.height = 1;
+        cloudWithRing.is_dense = true;
+
+        cloud.width = validPointCount;
+        cloud.height = 1;
+        cloud.is_dense = true;
+
+        const size_t removedPointCount = originalPointCount - validPointCount;
+        if (removedPointCount != 0)
+        {
+            // ROS_WARN_THROTTLE(5.0,
+            //                   "Removed %zu invalid points from the Robosense32 input point cloud.",
+            //                   removedPointCount);
+        }
+        return true;
+    }
+
+    bool hasRing() const override
+    {
+        return true;
+    }
+
+    std::string name() const override
+    {
+        return "robosense32";
+    }
+
+    bool firstPointTimestamp(const sensor_msgs::PointCloud2& msg,
+                             ros::Time& timestamp) const override
+    {
+        if (msg.width == 0 || msg.height == 0)
+            return false;
+
+        const sensor_msgs::PointField* timestampField = nullptr;
+        for (size_t i = 0; i < msg.fields.size(); ++i)
+        {
+            if (msg.fields[i].name == "timestamp")
+            {
+                timestampField = &msg.fields[i];
+                break;
+            }
+        }
+
+        if (timestampField == nullptr)
+            return false;
+
+        try
+        {
+            double firstTimestamp = 0.0;
+            if (timestampField->datatype == sensor_msgs::PointField::FLOAT64)
+            {
+                sensor_msgs::PointCloud2ConstIterator<double> timestampIterator(msg, "timestamp");
+                firstTimestamp = *timestampIterator;
+            }
+            else if (timestampField->datatype == sensor_msgs::PointField::FLOAT32)
+            {
+                sensor_msgs::PointCloud2ConstIterator<float> timestampIterator(msg, "timestamp");
+                firstTimestamp = *timestampIterator;
+            }
+            else
+            {
+                ROS_WARN_THROTTLE(5.0,
+                                  "Robosense point field 'timestamp' has unsupported datatype %u; "
+                                  "using the PointCloud2 header timestamp.",
+                                  timestampField->datatype);
+                return false;
+            }
+
+            if (!std::isfinite(firstTimestamp))
+                return false;
+
+            timestamp.fromSec(firstTimestamp);
+            return true;
+        }
+        catch (const std::exception& exception)
+        {
+            ROS_WARN_THROTTLE(5.0,
+                              "Failed to read the first Robosense point timestamp: %s",
+                              exception.what());
+            return false;
+        }
+    }
+};
+
+std::unique_ptr<LidarHandler> createLidarHandler(const std::string& configuredType)
+{
+    std::string lidarType = configuredType;
+    std::transform(lidarType.begin(), lidarType.end(), lidarType.begin(),
+                   [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+
+    if (lidarType == "robosense32" || lidarType == "rb32")
+        return std::unique_ptr<LidarHandler>(new Rb32Handler());
+
+    ROS_ERROR("Unsupported lidar_type '%s'. Supported types: robosense32 (rb32).",
+              configuredType.c_str());
+    return nullptr;
+}
+
 class ImageProjection{
 private:
 
@@ -51,10 +262,13 @@ private:
     ros::Publisher pubSegmentedCloudInfo;
     ros::Publisher pubOutlierCloud;
 
+    std::unique_ptr<LidarHandler> lidarHandler;
+    std::string lidarType;
+
     pcl::PointCloud<PointType>::Ptr laserCloudIn;
     pcl::PointCloud<PointXYZIR>::Ptr laserCloudInRing;
 
-    pcl::PointCloud<PointType>::Ptr fullCloud; // projected velodyne raw cloud, but saved in the form of 1-D matrix
+    pcl::PointCloud<PointType>::Ptr fullCloud; // projected lidar raw cloud, saved in the form of a 1-D matrix
     pcl::PointCloud<PointType>::Ptr fullInfoCloud; // same as fullCloud, but with intensity - range
 
     pcl::PointCloud<PointType>::Ptr groundCloud;
@@ -72,7 +286,7 @@ private:
     float startOrientation;
     float endOrientation;
 
-    // Transform from the lidar frame (rslidar) to the IMU/body frame
+    // Transform from the lidar frame to the IMU/body frame
     // (base_link). Translation is in metres and RPY is in radians.
     Eigen::Isometry3f lidarToImuTransform;
 
@@ -92,6 +306,13 @@ public:
         nh("~"){
 
         lidarToImuTransform.setIdentity();
+
+        nh.param("lidar_type", lidarType, std::string("robosense32"));
+        lidarHandler = createLidarHandler(lidarType);
+        if (!lidarHandler)
+            throw std::runtime_error("Unable to create lidar handler.");
+        ROS_INFO("Using lidar handler: %s", lidarHandler->name().c_str());
+
         loadLidarToImuExtrinsics();
 
         subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 1, &ImageProjection::cloudHandler, this);
@@ -214,88 +435,20 @@ public:
 
     void copyPointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
-        cloudHeader = laserCloudMsg->header;
+        // The selected lidar handler owns lidar-specific packet conversion and
+        // timestamp conventions.
+        if (!lidarHandler->process(laserCloudMsg, *laserCloudIn, *laserCloudInRing,
+                                   cloudHeader))
+        {
+            ROS_WARN_THROTTLE(5.0, "Skipping point cloud because lidar processing failed.");
+            return;
+        }
+
         // The points are transformed below into the IMU/body frame.
         cloudHeader.frame_id = "base_link";
 
-        if (useCloudRing)
-        {
-            pcl::fromROSMsg(*laserCloudMsg, *laserCloudInRing);
-
-            // Filter the ring cloud and the XYZI cloud together. Filtering only
-            // laserCloudIn would shift point indices and associate valid points
-            // with the wrong ring after a NaN/Inf point is removed.
-            laserCloudIn->clear();
-            laserCloudIn->header = laserCloudInRing->header;
-            laserCloudIn->sensor_origin_ = laserCloudInRing->sensor_origin_;
-            laserCloudIn->sensor_orientation_ = laserCloudInRing->sensor_orientation_;
-            laserCloudIn->reserve(laserCloudInRing->size());
-
-            size_t validPointCount = 0;
-            const size_t originalPointCount = laserCloudInRing->size();
-            for (size_t i = 0; i < originalPointCount; ++i)
-            {
-                const PointXYZIR& ringPoint = laserCloudInRing->points[i];
-                if (!std::isfinite(ringPoint.x) || !std::isfinite(ringPoint.y) ||
-                    !std::isfinite(ringPoint.z))
-                    continue;
-
-                if (validPointCount != i)
-                    laserCloudInRing->points[validPointCount] = ringPoint;
-
-                PointType point{};
-                point.x = ringPoint.x;
-                point.y = ringPoint.y;
-                point.z = ringPoint.z;
-                point.intensity = ringPoint.intensity;
-                point = transformLidarPointToImu(point);
-                laserCloudIn->push_back(point);
-                ++validPointCount;
-            }
-
-            laserCloudIn->width = validPointCount;
-            laserCloudIn->height = 1;
-            laserCloudIn->is_dense = true;
-            laserCloudInRing->points.resize(validPointCount);
-            laserCloudInRing->width = validPointCount;
-            laserCloudInRing->height = 1;
-            laserCloudInRing->is_dense = true;
-
-            const size_t removedPointCount = originalPointCount - validPointCount;
-            if (removedPointCount != 0)
-                ROS_WARN_THROTTLE(5.0, "Removed %zu NaN/Inf points from the input point cloud.",
-                                  removedPointCount);
-        }
-        else
-        {
-            pcl::fromROSMsg(*laserCloudMsg, *laserCloudIn);
-            for (PointType& point : laserCloudIn->points)
-                point = transformLidarPointToImu(point);
-
-            const size_t originalPointCount = laserCloudIn->size();
-            size_t validPointCount = 0;
-            for (size_t i = 0; i < originalPointCount; ++i)
-            {
-                const PointType& point = laserCloudIn->points[i];
-                if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
-                    !std::isfinite(point.z))
-                    continue;
-
-                if (validPointCount != i)
-                    laserCloudIn->points[validPointCount] = point;
-                ++validPointCount;
-            }
-
-            laserCloudIn->points.resize(validPointCount);
-            laserCloudIn->width = validPointCount;
-            laserCloudIn->height = 1;
-            laserCloudIn->is_dense = true;
-
-            const size_t removedPointCount = originalPointCount - validPointCount;
-            if (removedPointCount != 0)
-                ROS_WARN_THROTTLE(5.0, "Removed %zu NaN/Inf points from the input point cloud.",
-                                  removedPointCount);
-        }
+        for (PointType& point : laserCloudIn->points)
+            point = transformLidarPointToImu(point);
     }
 
     void cloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
@@ -341,7 +494,7 @@ public:
             thisPoint.y = laserCloudIn->points[i].y;
             thisPoint.z = laserCloudIn->points[i].z;
             // find the row and column index in the iamge for this point
-            if (useCloudRing == true){
+            if (lidarHandler->hasRing()){
                 rowIdn = laserCloudInRing->points[i].ring;
             }
             else{

@@ -1,3 +1,7 @@
+# LiDAR driver/model handler used by imageProjection.
+# Current supported value: robosense32 (alias: rb32).
+lidar_type: robosense32
+
 # Lidar-to-IMU extrinsic calibration used by imageProjection.
 # The transform is applied as: p_imu = R_lidar_to_imu * p_lidar + t_lidar_to_imu.
 # Angles use ROS RPY order (roll, pitch, yaw) and are expressed in radians.

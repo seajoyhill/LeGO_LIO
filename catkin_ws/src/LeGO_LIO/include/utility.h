@@ -61,8 +61,6 @@ typedef pcl::PointXYZI PointType;
 static const string pointCloudTopic = "/velodyne_points";
 static const string imuTopic = "/imu";
 static const string fileDirectory = "/tmp/";
-constexpr bool useCloudRing = true;
-
 constexpr int N_SCAN = 32;
 constexpr int Horizon_SCAN = 1800;
 constexpr float ang_res_x = 0.2;
