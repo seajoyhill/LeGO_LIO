@@ -368,9 +368,13 @@ public:
     Eigen::Vector3f transformPointToStart(const PointType& point,
                                            const float transform[6]) const
     {
-        const float s = scanPeriod > 0.0f
-                      ? (point.intensity - std::floor(point.intensity)) / scanPeriod
-                      : 0.0f;
+        // 这里是否有逐点更新的必要？因为IMU那里已经做过去畸变，整个点云应该视作一个整体。
+        // 如果IMU那里没有做去畸变，那么这里就需要逐点更新了，但是相应的我们的雅可比矩阵里应该也要有s的影响。
+        // 总之，不管哪种情况，这里总是矛盾的，我先按照整体去理解
+        // const float s = scanPeriod > 0.0f
+        //               ? (point.intensity - std::floor(point.intensity)) / scanPeriod
+        //               : 0.0f;
+        const float s = 1.0f;
         const Eigen::Matrix3f rotation = rotationMatrix(
             s * transform[0], s * transform[1], s * transform[2]);
         const Eigen::Vector3f translation(
@@ -1209,13 +1213,13 @@ public:
         Eigen::Vector3f pEnd = rotationEnd * pStart + translationEnd;
 
         // Apply the IMU start-to-end correction in the same FLU frame.
-        const Eigen::Matrix3f rotationImuStart =
+        [[maybe_unused]] const Eigen::Matrix3f rotationImuStart =
             rotationMatrix(imuRollStart, imuPitchStart, imuYawStart);
-        const Eigen::Matrix3f rotationImuEnd =
+        [[maybe_unused]] const Eigen::Matrix3f rotationImuEnd =
             rotationMatrix(imuRollLast, imuPitchLast, imuYawLast);
         const Eigen::Vector3f imuShift(
             imuShiftFromStartX, imuShiftFromStartY, imuShiftFromStartZ);
-        pEnd = rotationImuEnd.transpose() * rotationImuStart * (pEnd - imuShift);
+        // pEnd = rotationImuEnd.transpose() * rotationImuStart * (pEnd - imuShift);
 
         po->x = pEnd.x();
         po->y = pEnd.y();
@@ -1682,10 +1686,10 @@ public:
 
         float roll, pitch, yaw;
         matrixToRPY(rotationNew, roll, pitch, yaw);
-        PluginIMURotation(roll, pitch, yaw,
-                          imuRollStart, imuPitchStart, imuYawStart,
-                          imuRollLast, imuPitchLast, imuYawLast,
-                          roll, pitch, yaw);
+        // PluginIMURotation(roll, pitch, yaw,
+        //                   imuRollStart, imuPitchStart, imuYawStart,
+        //                   imuRollLast, imuPitchLast, imuYawLast,
+        //                   roll, pitch, yaw);
 
         transformSum[0] = roll;
         transformSum[1] = pitch;
