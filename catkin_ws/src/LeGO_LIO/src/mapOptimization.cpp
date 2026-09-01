@@ -55,6 +55,12 @@ struct PoseState {
     Eigen::Vector3f translation = Eigen::Vector3f::Zero();
 };
 
+struct Scan2MapStats {
+    bool mapReady = false;
+    int iterations = 0;
+    size_t correspondences = 0;
+};
+
 Eigen::Matrix3f rotationFromRPY(float roll, float pitch, float yaw)
 {
     // ROS fixed-axis RPY: R = Rz(yaw) * Ry(pitch) * Rx(roll).
@@ -287,7 +293,13 @@ public:
         initializeMapGuessFromOdometry();
         extractSurroundingKeyFrames();
         downsampleCurrentScan();
-        scan2MapOptimization();
+
+        // Keep the odometry-propagated initial guess so the log below reports
+        // only the correction introduced by scan-to-map, before GTSAM runs.
+        const PoseState scan2MapInitialGuess = currentMappedPose();
+        const Scan2MapStats scan2MapStats = scan2MapOptimization();
+        logScan2MapCorrection(scan2MapInitialGuess, currentMappedPose(), scan2MapStats);
+
         updateMappedPose();
         saveKeyFrameAndOdometryFactor();
         publishOutputs();
@@ -664,10 +676,13 @@ private:
         return deltaR < 0.05f && deltaT < 0.05f;
     }
 
-    void scan2MapOptimization()
+    Scan2MapStats scan2MapOptimization()
     {
+        Scan2MapStats stats;
         if (laserCloudCornerFromMapDS_->size() <= 10 || laserCloudSurfFromMapDS_->size() <= 100)
-            return;
+            return stats;
+
+        stats.mapReady = true;
 
         // This is deliberately the original LeGO-LOAM mapping loop:
         // correspondence search -> corner/surface residuals -> LM update,
@@ -679,9 +694,60 @@ private:
             coeffSel_->clear();
             cornerOptimization();
             surfOptimization();
+            stats.iterations = iter + 1;
+            stats.correspondences = laserCloudOri_->size();
             if (optimizePose())
                 break;
         }
+        return stats;
+    }
+
+    void logScan2MapCorrection(
+        const PoseState& initialGuess, const PoseState& optimizedPose, const Scan2MapStats& stats) const
+    {
+        if (!stats.mapReady)
+            return;
+
+        // T_after = T_before * deltaScan, so deltaScan is expressed in the
+        // FLU body frame of the odometry-propagated initial guess.
+        const PoseState deltaScan = compose(inverse(initialGuess), optimizedPose);
+        float scanRoll, scanPitch, scanYaw;
+        rpyFromRotation(deltaScan.rotation, scanRoll, scanPitch, scanYaw);
+
+        // Also report the accumulated mapping correction relative to the raw
+        // frontend laser odometry at this timestamp. This includes corrections
+        // carried forward from previous mapping frames.
+        const PoseState laserOdomPose = stateFromArray(transformSum_);
+        const PoseState deltaFromLaserOdom = compose(inverse(laserOdomPose), optimizedPose);
+        float totalRoll, totalPitch, totalYaw;
+        rpyFromRotation(deltaFromLaserOdom.rotation, totalRoll, totalPitch, totalYaw);
+
+        constexpr float kRadToDeg = 180.0f / static_cast<float>(M_PI);
+        const float scanRotationMagnitude
+            = Eigen::AngleAxisf(deltaScan.rotation).angle() * kRadToDeg;
+        const float totalRotationMagnitude
+            = Eigen::AngleAxisf(deltaFromLaserOdom.rotation).angle() * kRadToDeg;
+
+        // The project logger writes this record to ~log/file, configured in
+        // params.yaml. The {node} token is expanded to the ROS node name.
+        LOGF_INFO("[scan2map correction] stamp=%.6f, iterations=%d, correspondences=%zu\n"
+                  "  scan-only (initial guess -> optimized, local FLU): "
+                  "dxyz=[%+.4f, %+.4f, %+.4f] m, drpy=[%+.3f, %+.3f, %+.3f] deg, "
+                  "|dt|=%.4f m, |dR|=%.3f deg\n"
+                  "  total (laser odometry -> mapped, local FLU):       "
+                  "dxyz=[%+.4f, %+.4f, %+.4f] m, drpy=[%+.3f, %+.3f, %+.3f] deg, "
+                  "|dt|=%.4f m, |dR|=%.3f deg",
+            timeLaserOdometry_, stats.iterations, stats.correspondences,
+            deltaScan.translation.x(), deltaScan.translation.y(), deltaScan.translation.z(),
+            scanRoll * kRadToDeg, scanPitch * kRadToDeg, scanYaw * kRadToDeg,
+            deltaScan.translation.norm(), scanRotationMagnitude,
+            deltaFromLaserOdom.translation.x(), deltaFromLaserOdom.translation.y(),
+            deltaFromLaserOdom.translation.z(), totalRoll * kRadToDeg, totalPitch * kRadToDeg,
+            totalYaw * kRadToDeg, deltaFromLaserOdom.translation.norm(), totalRotationMagnitude);
+
+        // INFO is normally buffered by the logger. Explicitly flush the
+        // low-rate correction record to preserve it during bag replay.
+        lego_lio::log::Logger::instance().flush();
     }
 
     void updateMappedPose()

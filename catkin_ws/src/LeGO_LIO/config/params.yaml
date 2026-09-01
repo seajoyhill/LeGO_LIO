@@ -1,5 +1,7 @@
 # Lightweight header-only logger. Supported levels, from most to least verbose:
 # trace, debug, info, warn, error, fatal, off. {node} is replaced by the ROS node name.
+# mapOptimization writes each scan-to-map correction to the configured file.
+# {node} is replaced with the ROS node name, e.g. mapOptimization.
 log:
   level: info
   file: /tmp/lego_lio_{node}.log
