@@ -10,6 +10,7 @@
         type="featureAssociation"
         name="featureAssociation"
         output="screen">
+    <rosparam command="load" file="$(find lego_lio)/config/params.yaml" />
     <param name="debug_deskew" value="false" />
   </node>
 

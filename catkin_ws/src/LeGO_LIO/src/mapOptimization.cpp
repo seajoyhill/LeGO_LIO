@@ -838,7 +838,9 @@ private:
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "mapOptimization");
-    ROS_INFO("----> Map Optimization Started (standard ROS FLU coordinates).");
+    ros::NodeHandle privateNode("~");
+    lego_lio::configureLogger(privateNode);
+    LOG_INFO << "Map Optimization Started (standard ROS FLU coordinates).";
 
     MapOptimization mapOptimization;
     ros::Rate rate(200);

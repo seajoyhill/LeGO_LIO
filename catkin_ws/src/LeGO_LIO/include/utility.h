@@ -22,6 +22,8 @@
 
 #include <ros/ros.h>
 
+#include "logger.hpp"
+
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -144,5 +146,61 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIRPYT,
 )
 
 typedef PointXYZIRPYT PointTypePose;
+
+namespace lego_lio
+{
+inline std::string loggerNodeName()
+{
+    std::string name = ros::this_node::getName();
+    while (!name.empty() && name.front() == '/')
+        name.erase(name.begin());
+    std::replace(name.begin(), name.end(), '/', '_');
+    return name.empty() ? "node" : name;
+}
+
+inline std::string expandLoggerPath(std::string path)
+{
+    const std::string token = "{node}";
+    const std::string nodeName = loggerNodeName();
+    std::string::size_type position = 0;
+    while ((position = path.find(token, position)) != std::string::npos) {
+        path.replace(position, token.size(), nodeName);
+        position += nodeName.size();
+    }
+    return path;
+}
+
+// Applies optional private ROS parameters under ~log. When a parameter is not
+// present, the logger keeps its API/environment/default value.
+inline bool configureLogger(const ros::NodeHandle& privateNode)
+{
+    log::Logger& logger = log::Logger::instance();
+    bool valid = true;
+    std::string value;
+    bool flag = true;
+
+    if (privateNode.getParam("log/level", value) && !logger.setLevel(value)) {
+        ROS_WARN("Invalid ~log/level '%s'; keeping the previous level.", value.c_str());
+        valid = false;
+    }
+    if (privateNode.getParam("log/console", flag))
+        logger.setConsoleEnabled(flag);
+    if (privateNode.getParam("log/flush_level", value) && !logger.setFlushLevel(value)) {
+        ROS_WARN("Invalid ~log/flush_level '%s'; keeping the previous level.", value.c_str());
+        valid = false;
+    }
+
+    bool append = true;
+    privateNode.param("log/append", append, true);
+    if (privateNode.getParam("log/file", value)) {
+        value = expandLoggerPath(value);
+        if (!logger.setFile(value, append)) {
+            ROS_ERROR("Cannot open LeGO-LIO log file '%s'.", value.c_str());
+            valid = false;
+        }
+    }
+    return valid;
+}
+}  // namespace lego_lio
 
 #endif

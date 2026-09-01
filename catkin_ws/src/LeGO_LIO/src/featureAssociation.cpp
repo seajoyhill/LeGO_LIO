@@ -1839,8 +1839,10 @@ public:
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "lego_loam");
+    ros::NodeHandle privateNode("~");
+    lego_lio::configureLogger(privateNode);
 
-    ROS_INFO("\033[1;32m---->\033[0m Feature Association Started.");
+    LOG_INFO << "Feature Association Started.";
 
     FeatureAssociation FA;
 

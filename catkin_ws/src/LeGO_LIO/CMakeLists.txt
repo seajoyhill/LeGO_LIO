@@ -79,3 +79,8 @@ target_link_libraries(featureAssociation ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${
 add_executable(mapOptimization src/mapOptimization.cpp)
 add_dependencies(mapOptimization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_link_libraries(mapOptimization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam ${Boost_LIBRARIES})
+if(CATKIN_ENABLE_TESTING)
+  add_executable(logger_test test/logger_test.cpp)
+  target_link_libraries(logger_test ${catkin_LIBRARIES})
+  add_test(NAME lego_lio_logger_test COMMAND logger_test)
+endif()

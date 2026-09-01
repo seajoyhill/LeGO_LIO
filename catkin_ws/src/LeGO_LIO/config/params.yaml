@@ -1,3 +1,12 @@
+# Lightweight header-only logger. Supported levels, from most to least verbose:
+# trace, debug, info, warn, error, fatal, off. {node} is replaced by the ROS node name.
+log:
+  level: info
+  file: /tmp/lego_lio_{node}.log
+  console: true
+  append: true
+  flush_level: warn
+
 # LiDAR driver/model handler used by imageProjection.
 # Current supported value: robosense32 (alias: rb32).
 lidar_type: robosense32
