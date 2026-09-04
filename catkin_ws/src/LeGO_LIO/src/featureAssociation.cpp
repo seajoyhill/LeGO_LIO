@@ -36,6 +36,7 @@
 
 #include <Eigen/Geometry>
 #include <pcl/io/pcd_io.h>
+#include <pcl/segmentation/sac_segmentation.h>
 
 #include <set>
 #include <sstream>
@@ -201,6 +202,29 @@ private:
     int frameCount;
     int deskewFrameCounter;
 
+    // Ground-plane normal constraint. The plane is estimated from the
+    // deskewed ground-labelled points in the current scan. Normals are kept
+    // in the scan-start/base_link frame, which is also the frame used by the
+    // scan-to-scan transform.
+    bool groundConstraintEnabled;
+    int groundRansacIterations;
+    int groundRansacMinInliers;
+    float groundRansacDistanceThreshold;
+    float groundRansacMaxTiltDeg;
+    float groundRansacMinInlierRatio;
+    float groundDistanceSigma;
+    bool groundDebugLogEnabled;
+    int groundDebugLogEveryNFrames;
+    Eigen::Matrix3f lidarToImuRotation;
+    Eigen::Vector3f lidarToImuTranslation;
+    Eigen::Vector3f groundNormalLidarCur;
+    float groundDistanceLidarCur;
+    bool groundPlaneValidCur;
+    bool groundPlaneValidLast;
+    Eigen::Vector3f groundNormalCur;
+    float groundPlaneOffsetCur;
+    float groundPlaneOffsetLast;
+
 public:
 
     FeatureAssociation():
@@ -225,8 +249,48 @@ public:
         initializationValue();
 
         nh.param("debug_deskew", debugDeskew, true);
-        ROS_INFO("FeatureAssociation deskew diagnostics: %s",
-                 debugDeskew ? "enabled" : "disabled");
+        nh.param("ground_constraint/enabled", groundConstraintEnabled, true);
+        nh.param("ground_constraint/ransac_iterations", groundRansacIterations, 100);
+        nh.param("ground_constraint/ransac_min_inliers", groundRansacMinInliers, 100);
+        nh.param("ground_constraint/ransac_distance_threshold",
+                 groundRansacDistanceThreshold, 0.05f);
+        nh.param("ground_constraint/ransac_max_tilt_deg", groundRansacMaxTiltDeg, 35.0f);
+        nh.param("ground_constraint/ransac_min_inlier_ratio", groundRansacMinInlierRatio, 0.5f);
+        nh.param("ground_constraint/distance_sigma", groundDistanceSigma, 0.05f);
+        if (groundDistanceSigma <= 1e-6f)
+            groundDistanceSigma = 0.05f;
+        nh.param("ground_constraint/debug_log", groundDebugLogEnabled, true);
+        nh.param("ground_constraint/debug_log_every_n_frames", groundDebugLogEveryNFrames, 1);
+        groundDebugLogEveryNFrames = std::max(1, groundDebugLogEveryNFrames);
+
+        double lidarRoll = 0.0;
+        double lidarPitch = 0.0;
+        double lidarYaw = 0.0;
+        double lidarX = 0.0;
+        double lidarY = 0.0;
+        double lidarZ = 0.0;
+        nh.param("lidar_to_imu/angle/roll", lidarRoll, 0.0);
+        nh.param("lidar_to_imu/angle/pitch", lidarPitch, 0.0);
+        nh.param("lidar_to_imu/angle/yaw", lidarYaw, 0.0);
+        nh.param("lidar_to_imu/distance/x", lidarX, 0.0);
+        nh.param("lidar_to_imu/distance/y", lidarY, 0.0);
+        nh.param("lidar_to_imu/distance/z", lidarZ, 0.0);
+        lidarToImuRotation = rotationMatrix(static_cast<float>(lidarRoll),
+                                             static_cast<float>(lidarPitch),
+                                             static_cast<float>(lidarYaw));
+        lidarToImuTranslation = Eigen::Vector3f(static_cast<float>(lidarX),
+                                                static_cast<float>(lidarY),
+                                                static_cast<float>(lidarZ));
+        LOGF_INFO("[GROUND_CONFIG] enabled=%d distance_sigma_m=%.6f distance_weight=%.6f "
+                  "ransac_iterations=%d min_inliers=%d min_ratio=%.3f distance_threshold=%.4f "
+                  "max_tilt_deg=%.3f debug_every_n_frames=%d",
+                  groundConstraintEnabled ? 1 : 0,
+                  groundDistanceSigma, 1.0f / groundDistanceSigma,
+                  groundRansacIterations, groundRansacMinInliers,
+                  groundRansacMinInlierRatio, groundRansacDistanceThreshold,
+                  groundRansacMaxTiltDeg, groundDebugLogEveryNFrames);
+        LOG_INFO << "FeatureAssociation deskew diagnostics: "
+                 << (debugDeskew ? "enabled" : "disabled");
     }
 
     void initializationValue()
@@ -339,6 +403,25 @@ public:
 
         frameCount = skipFrameNum;
         deskewFrameCounter = 0;
+
+        groundConstraintEnabled = true;
+        groundRansacIterations = 100;
+        groundRansacMinInliers = 100;
+        groundRansacDistanceThreshold = 0.05f;
+        groundRansacMaxTiltDeg = 35.0f;
+        groundRansacMinInlierRatio = 0.5f;
+        groundDistanceSigma = 0.05f;
+        groundDebugLogEnabled = true;
+        groundDebugLogEveryNFrames = 1;
+        groundPlaneValidCur = false;
+        groundPlaneValidLast = false;
+        groundNormalCur = Eigen::Vector3f::UnitZ();
+        lidarToImuRotation = Eigen::Matrix3f::Identity();
+        lidarToImuTranslation = Eigen::Vector3f::Zero();
+        groundNormalLidarCur = Eigen::Vector3f::UnitZ();
+        groundDistanceLidarCur = 0.0f;
+        groundPlaneOffsetCur = 0.0f;
+        groundPlaneOffsetLast = 0.0f;
     }
 
     Eigen::Matrix3f rotationMatrix(float roll, float pitch, float yaw) const
@@ -1261,6 +1344,161 @@ public:
         return degrees * M_PI / 180.0;
     }
 
+    // Fit the ground plane using PCL's official SACSegmentation/RANSAC
+    // implementation. For the plane coefficients [a, b, c, d], PCL models
+    // the plane as
+    //
+    //     Pi(p) = a*x + b*y + c*z + d = n^T p + d = 0,
+    //     n = [a, b, c]^T / ||[a, b, c]||.
+    //
+    // SACSegmentation selects a model with the largest set of points whose
+    // perpendicular distance |Pi(p)| is no greater than the configured
+    // distance threshold. Only points already marked as ground by
+    // imageProjection are supplied to RANSAC.
+    bool estimateGroundPlaneRansac()
+    {
+        groundPlaneValidCur = false;
+        groundNormalCur = Eigen::Vector3f::UnitZ();
+        groundNormalLidarCur = Eigen::Vector3f::UnitZ();
+        groundDistanceLidarCur = 0.0f;
+        groundPlaneOffsetCur = 0.0f;
+        if (!groundConstraintEnabled || segmentedCloud->size() < 3 ||
+            segInfo.segmentedCloudGroundFlag.size() < segmentedCloud->size())
+            return false;
+
+        pcl::PointCloud<PointType>::Ptr groundPoints(new pcl::PointCloud<PointType>());
+        groundPoints->reserve(segmentedCloud->size());
+        for (size_t i = 0; i < segmentedCloud->size(); ++i) {
+            if (!segInfo.segmentedCloudGroundFlag[i])
+                continue;
+            const PointType& point = segmentedCloud->points[i];
+            if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z))
+                groundPoints->push_back(point);
+        }
+
+        if (groundPoints->size() < static_cast<size_t>(std::max(3, groundRansacMinInliers)))
+            return false;
+
+        pcl::SACSegmentation<PointType> segmentation;
+        segmentation.setOptimizeCoefficients(true);
+        segmentation.setModelType(pcl::SACMODEL_PLANE);
+        segmentation.setMethodType(pcl::SAC_RANSAC);
+        segmentation.setMaxIterations(std::max(1, groundRansacIterations));
+        segmentation.setDistanceThreshold(std::max(1e-4f, groundRansacDistanceThreshold));
+        segmentation.setInputCloud(groundPoints);
+
+        pcl::PointIndices inliers;
+        pcl::ModelCoefficients coefficients;
+        segmentation.segment(inliers, coefficients);
+        if (inliers.indices.empty() || coefficients.values.size() < 4)
+            return false;
+
+        Eigen::Vector3f normal(coefficients.values[0], coefficients.values[1], coefficients.values[2]);
+        const float normalNorm = normal.norm();
+        if (normalNorm < 1e-5f)
+            return false;
+        normal /= normalNorm;
+        float offset = coefficients.values[3] / normalNorm;
+        if (normal.z() < 0.0f) {
+            normal = -normal;
+            offset = -offset;
+        }
+
+        const float minNormalZ = static_cast<float>(
+            std::cos(deg2rad(std::max(0.0f, std::min(89.0f, groundRansacMaxTiltDeg)))));
+        if (normal.z() < minNormalZ)
+            return false;
+
+        float squaredError = 0.0f;
+        for (const int index : inliers.indices) {
+            if (index < 0 || index >= static_cast<int>(groundPoints->size()))
+                continue;
+            const PointType& point = groundPoints->points[index];
+            const float distance = normal.x() * point.x + normal.y() * point.y +
+                                   normal.z() * point.z + offset;
+            squaredError += distance * distance;
+        }
+
+        const int inlierCount = static_cast<int>(inliers.indices.size());
+        const float inlierRatio = static_cast<float>(inlierCount) /
+                                  static_cast<float>(groundPoints->size());
+        const float rms = std::sqrt(squaredError /
+                                    static_cast<float>(std::max(1, inlierCount)));
+        if (inlierCount < groundRansacMinInliers ||
+            inlierRatio < groundRansacMinInlierRatio ||
+            rms > groundRansacDistanceThreshold)
+            return false;
+
+        // The fitted points are in the deskewed base_link/IMU frame. For
+        // p_imu = R_IL p_lidar + t_IL, the same plane expressed in the LiDAR
+        // frame has n_lidar = R_IL^T n_imu. The signed distance from the LiDAR
+        // origin to the plane is Pi(t_IL) = n_imu^T t_IL + d; its absolute
+        // value is the perpendicular LiDAR-to-ground distance in metres.
+        groundPlaneValidCur = true;
+        groundNormalCur = normal;
+        groundPlaneOffsetCur = offset;
+        groundNormalLidarCur = (lidarToImuRotation.transpose() * normal).normalized();
+        groundDistanceLidarCur = std::abs(normal.dot(lidarToImuTranslation) + offset);
+
+        if (groundDebugLogEnabled &&
+            deskewFrameCounter % groundDebugLogEveryNFrames == 0) {
+            LOGF_INFO("[GROUND_FIT] stamp=%.9f frame=%u valid=1 points=%zu inliers=%d "
+                      "ratio=%.6f rms_m=%.6f plane_base=[%.7f %.7f %.7f %.7f] "
+                      "normal_lidar=[%.7f %.7f %.7f] lidar_ground_distance_m=%.7f",
+                      timeScanCur, cloudHeader.seq, groundPoints->size(), inlierCount,
+                      inlierRatio, rms, normal.x(), normal.y(), normal.z(), offset,
+                      groundNormalLidarCur.x(), groundNormalLidarCur.y(),
+                      groundNormalLidarCur.z(), groundDistanceLidarCur);
+        }
+        return true;
+    }
+
+    // Keep only the ground-plane offset residual. With the frontend relative
+    // transform p_cur = R p_prev + t and current plane
+    // n_cur^T p_cur + d_cur = 0, the current plane expressed in the previous
+    // frame has d_pred_prev = d_cur + n_cur^T t. The scalar constraint is
+    //
+    //     r_d = d_cur + n_cur^T t - d_prev = 0.
+    //
+    // Its translation Jacobian is dr_d/dt = n_cur^T. On a nearly horizontal
+    // ground, n_cur ~= [0, 0, 1]^T, so it directly constrains relative z.
+    float groundDistanceResidual(const float relativeMotion[6]) const
+    {
+        if (!groundPlaneValidCur || !groundPlaneValidLast)
+            return 0.0f;
+        const Eigen::Vector3f translation(
+            relativeMotion[3], relativeMotion[4], relativeMotion[5]);
+        return groundPlaneOffsetCur + groundNormalCur.dot(translation) -
+               groundPlaneOffsetLast;
+    }
+
+    // Analytic Jacobian of r_d with respect to the frontend parameter vector
+    // x = [roll, pitch, yaw, t_x, t_y, t_z]^T:
+    //
+    //     r_d(x) = d_cur + n_cur^T t - d_prev.
+    //
+    // n_cur, d_cur and d_prev are measurements fixed during an LM iteration;
+    // r_d has no R(roll, pitch, yaw) term. Consequently,
+    //
+    //     dr_d/dx = [0, 0, 0, n_cur.x, n_cur.y, n_cur.z].
+    //
+    // calculateTransformationSurf() solves only [roll, pitch, z], hence its
+    // row is [0, 0, n_cur.z]. No finite-difference approximation is needed.
+    float groundDistanceJacobian(int variableIndex) const
+    {
+        if (!groundPlaneValidCur || !groundPlaneValidLast ||
+            variableIndex < 0 || variableIndex >= 6)
+            return 0.0f;
+        return variableIndex < 3 ? 0.0f : groundNormalCur[variableIndex - 3];
+    }
+
+    void commitGroundPlane()
+    {
+        groundPlaneValidLast = groundPlaneValidCur;
+        if (groundPlaneValidCur)
+            groundPlaneOffsetLast = groundPlaneOffsetCur;
+    }
+
     void findCorrespondingCornerFeatures(int iterCount){
 
         int cornerPointsSharpNum = cornerPointsSharp->points.size();
@@ -1489,12 +1727,20 @@ public:
 
     bool solveRelativeMotionTransform(
         const std::vector<int>& variableIndices,
-        int iterCount)
+        int iterCount,
+        bool includeGroundDistance)
     {
         const int pointSelNum = static_cast<int>(laserCloudOri->points.size());
         const int variableCount = static_cast<int>(variableIndices.size());
-        cv::Mat matA(pointSelNum, variableCount, CV_32F, cv::Scalar::all(0));
-        cv::Mat matB(pointSelNum, 1, CV_32F, cv::Scalar::all(0));
+        const bool useGroundDistance = includeGroundDistance &&
+                                       groundPlaneValidCur && groundPlaneValidLast;
+        const int groundResidualNum = useGroundDistance ? 1 : 0;
+        const int residualNum = pointSelNum + groundResidualNum;
+        cv::Mat matA(residualNum, variableCount, CV_32F, cv::Scalar::all(0));
+        cv::Mat matB(residualNum, 1, CV_32F, cv::Scalar::all(0));
+        float transformBefore[6];
+        for (int i = 0; i < 6; ++i)
+            transformBefore[i] = transformCur[i];
 
         for (int i = 0; i < pointSelNum; ++i) {
             const PointType& point = laserCloudOri->points[i];
@@ -1508,6 +1754,30 @@ public:
                     residualJacobian(0, variableIndices[j]);
             }
             matB.at<float>(i, 0) = -0.05f * coefficient.intensity;
+        }
+
+        if (useGroundDistance) {
+            // Whiten the scalar plane-offset residual with its metric
+            // standard deviation: A_d = J_d / sigma_d, b_d = -r_d / sigma_d.
+            const int matrixRow = pointSelNum;
+            const float weight = 1.0f / groundDistanceSigma;
+            const float residual = groundDistanceResidual(transformCur);
+            for (int j = 0; j < variableCount; ++j)
+                matA.at<float>(matrixRow, j) =
+                    weight * groundDistanceJacobian(variableIndices[j]);
+            matB.at<float>(matrixRow, 0) = -weight * residual;
+        }
+
+        cv::Mat surfaceAtA;
+        cv::Mat groundAtA;
+        cv::Mat surfaceDelta;
+        if (useGroundDistance && pointSelNum > 0) {
+            const cv::Mat surfaceA = matA.rowRange(0, pointSelNum);
+            const cv::Mat surfaceB = matB.rowRange(0, pointSelNum);
+            surfaceAtA = surfaceA.t() * surfaceA;
+            cv::solve(surfaceAtA, surfaceA.t() * surfaceB, surfaceDelta, cv::DECOMP_QR);
+            const cv::Mat groundA = matA.rowRange(pointSelNum, residualNum);
+            groundAtA = groundA.t() * groundA;
         }
 
         cv::Mat matAt;
@@ -1553,25 +1823,73 @@ public:
                 deltaTranslationCmSq += std::pow(increment * 100.0f, 2);
         }
 
+        if (useGroundDistance && groundDebugLogEnabled &&
+            deskewFrameCounter % groundDebugLogEveryNFrames == 0) {
+            const float residualBefore = groundDistanceResidual(transformBefore);
+            const float residualAfter = groundDistanceResidual(transformCur);
+
+            float surfaceDx[3] = {0.0f, 0.0f, 0.0f};
+            if (!surfaceDelta.empty() && surfaceDelta.rows == variableCount) {
+                for (int j = 0; j < std::min(3, variableCount); ++j)
+                    surfaceDx[j] = surfaceDelta.at<float>(j, 0);
+            }
+            float surfaceHDiag[3] = {0.0f, 0.0f, 0.0f};
+            float distanceHDiag[3] = {0.0f, 0.0f, 0.0f};
+            for (int j = 0; j < std::min(3, variableCount); ++j) {
+                if (!surfaceAtA.empty())
+                    surfaceHDiag[j] = surfaceAtA.at<float>(j, j);
+                if (!groundAtA.empty())
+                    distanceHDiag[j] = groundAtA.at<float>(j, j);
+            }
+
+            LOGF_INFO("[GROUND_DISTANCE_SOLVE] stamp=%.9f frame=%u iter=%d "
+                      "distance_sigma_m=%.6f distance_weight=%.6f "
+                      "surface_rows=%d distance_rows=%d variables=[%d %d %d] "
+                      "plane_offset_prev_m=%.9f plane_offset_cur_m=%.9f "
+                      "res_before_m=%.9f res_after_m=%.9f "
+                      "H_surface_diag=[%.7e %.7e %.7e] H_distance_diag=[%.7e %.7e %.7e] "
+                      "dx_surface_only=[%.9f %.9f %.9f] dx_combined=[%.9f %.9f %.9f] "
+                      "transform_before_rpz=[%.9f %.9f %.9f] transform_after_rpz=[%.9f %.9f %.9f]",
+                      timeScanCur, cloudHeader.seq, iterCount,
+                      groundDistanceSigma, 1.0f / groundDistanceSigma,
+                      pointSelNum, groundResidualNum,
+                      variableCount > 0 ? variableIndices[0] : -1,
+                      variableCount > 1 ? variableIndices[1] : -1,
+                      variableCount > 2 ? variableIndices[2] : -1,
+                      groundPlaneOffsetLast, groundPlaneOffsetCur,
+                      residualBefore, residualAfter,
+                      surfaceHDiag[0], surfaceHDiag[1], surfaceHDiag[2],
+                      distanceHDiag[0], distanceHDiag[1], distanceHDiag[2],
+                      surfaceDx[0], surfaceDx[1], surfaceDx[2],
+                      variableCount > 0 ? matX.at<float>(0, 0) : 0.0f,
+                      variableCount > 1 ? matX.at<float>(1, 0) : 0.0f,
+                      variableCount > 2 ? matX.at<float>(2, 0) : 0.0f,
+                      transformBefore[0], transformBefore[1], transformBefore[5],
+                      transformCur[0], transformCur[1], transformCur[5]);
+        }
+
         return std::sqrt(deltaRotationDegSq) >= 0.1f ||
                std::sqrt(deltaTranslationCmSq) >= 0.1f;
     }
 
     bool calculateTransformationSurf(int iterCount)
     {
-        // Ground/surface constraints primarily observe roll, pitch and z in FLU.
-        return solveRelativeMotionTransform({0, 1, 5}, iterCount);
+        // Surface point-to-plane residuals and one ground plane-offset
+        // residual are solved together. The ground residual directly
+        // constrains the ground-normal translation component (near z on a
+        // level ground) and intentionally does not constrain attitude.
+        return solveRelativeMotionTransform({0, 1, 5}, iterCount, true);
     }
 
     bool calculateTransformationCorner(int iterCount)
     {
         // Edge constraints primarily observe yaw and horizontal translation in FLU.
-        return solveRelativeMotionTransform({2, 3, 4}, iterCount);
+        return solveRelativeMotionTransform({2, 3, 4}, iterCount, false);
     }
 
     bool calculateTransformation(int iterCount)
     {
-        return solveRelativeMotionTransform({0, 1, 2, 3, 4, 5}, iterCount);
+        return solveRelativeMotionTransform({0, 1, 2, 3, 4, 5}, iterCount, false);
     }
 
     void checkSystemInitialization(){
@@ -1712,6 +2030,22 @@ public:
         laserOdometry.pose.pose.position.z = transformSum[5];
         pubLaserOdometry.publish(laserOdometry);
 
+        if (groundDebugLogEnabled &&
+            deskewFrameCounter % groundDebugLogEveryNFrames == 0) {
+            LOGF_INFO("[GROUND_ODOM] stamp=%.9f frame=%u plane_valid=%d "
+                      "distance_sigma_m=%.6f normal_base=[%.7f %.7f %.7f] "
+                      "lidar_ground_distance_m=%.7f relative_rpyz=[%.9f %.9f %.9f %.9f] "
+                      "odom_rpyxyz=[%.9f %.9f %.9f %.9f %.9f %.9f]",
+                      timeScanCur, cloudHeader.seq, groundPlaneValidCur ? 1 : 0,
+                      groundDistanceSigma,
+                      groundNormalCur.x(), groundNormalCur.y(), groundNormalCur.z(),
+                      groundDistanceLidarCur,
+                      transformCur[0], transformCur[1], transformCur[2], transformCur[5],
+                      transformSum[0], transformSum[1], transformSum[2],
+                      transformSum[3], transformSum[4], transformSum[5]);
+            lego_lio::log::Logger::instance().flush();
+        }
+
         laserOdometryTrans.stamp_ = cloudHeader.stamp;
         laserOdometryTrans.setRotation(tf::Quaternion(
             orientation.x, orientation.y, orientation.z, orientation.w));
@@ -1803,6 +2137,7 @@ public:
         ++deskewFrameCounter;
         const pcl::PointCloud<PointType> rawSegmentedCloud = *segmentedCloud;
         adjustDistortion();
+        estimateGroundPlaneRansac();
         saveDeskewDebugClouds(deskewFrameCounter, rawSegmentedCloud, *segmentedCloud);
 
         calculateSmoothness();
@@ -1818,6 +2153,7 @@ public:
         */
         if (!systemInitedLM) {
             checkSystemInitialization();
+            commitGroundPlane();
             return;
         }
 
@@ -1830,6 +2166,7 @@ public:
         publishOdometry();
 
         publishCloudsLast(); // cloud to mapOptimization
+        commitGroundPlane();
     }
 };
 
