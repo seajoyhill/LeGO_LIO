@@ -1,0 +1,76 @@
+# LeGO_Calib: online calibration driven by LeGO-LIO mapOptimization.
+topics:
+  lidar_odom: /aft_mapped_to_init   # nav_msgs/Odometry from mapOptimization
+  imu: /imu
+  points: /velodyne_points           # RoboSense32 raw cloud; ring/time fields may be present
+
+# Orientation source selection:
+#   true  -> use /imu's sensor_msgs/Imu::orientation directly
+#   false -> estimate Ground -> IMU attitude with the original Fusion AHRS
+# The requested parameter spelling is kept for compatibility.
+imu:
+  use_imu_oriention: true
+frames:
+  path: map
+
+# Temporary fixed transform used by LeGO-LIO to convert LiDAR points into
+# the IMU/body frame. LeGO_Calib applies T_WL = T_WI * T_IL to recover the
+# LiDAR-origin trajectory from /aft_mapped_to_init.
+frontend_lidar_to_imu:
+  roll: 0.0
+  pitch: 0.0
+  yaw: 0.0
+  x: 0.27
+  y: 0.0
+  z: 0.20
+sync:
+  max_cloud_odom_dt: 0.06
+  max_imu_odom_dt: 0.03
+runtime:
+  movement_start_distance: 0.05
+  minimum_samples_to_solve: 8
+  max_samples: 30000
+calibration:
+  # /aft_mapped_to_init is mapOptimization output (default mappingProcessInterval=0.3 s), not 10 Hz raw LiDAR.
+  odom_frequency: 3
+  cut_frame_num: 1
+  mean_acc_norm: 9.81
+  imu_sensor_height: 0.30
+  data_accum_length: 300
+  x_accumulate: 0.01
+  y_accumulate: 0.01
+  z_accumulate: 0.99
+  trans_IL_x: 0.0
+  trans_IL_y: 0.0
+  trans_IL_z: 0.0
+  set_boundary: false
+  bound_th: 0.30
+  gyro_factor: 10.0
+  acc_factor: 1.0
+  ground_factor: 5.0
+  bspline_enable: true
+  bspline_ctrl_points: 50
+  bspline_degree: 3
+  bspline_smoothing: 0.0001
+ground_plane:
+  # Plain PCL SACSegmentation/RANSAC only; Patchwork++ is not used.
+  max_iterations: 300
+  min_inliers: 500
+  min_inlier_ratio: 0.20
+  distance_threshold: 0.03
+  max_rms: 0.03
+  max_tilt_deg: 25.0
+  voxel_leaf_size: 0.10
+  min_range: 1.0
+  max_range: 40.0
+  min_z: -3.0
+  max_z: 1.0
+
+ahrs:
+  nominal_frequency: 200.0
+  gain: 0.5
+  acceleration_rejection: 10.0
+  max_dt: 0.05
+
+output:
+  result_file: result/lego_calib_result.yaml

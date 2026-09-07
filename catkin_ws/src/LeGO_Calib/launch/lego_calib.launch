@@ -1,0 +1,6 @@
+<launch>
+  <!-- Start this alongside lego_lio/run.launch. Both consume the same /imu and /velodyne_points. -->
+  <node pkg="lego_calib" type="lego_calib_node" name="lego_calib" output="screen" required="false">
+    <rosparam command="load" file="$(find lego_calib)/config/lego_calib.yaml"/>
+  </node>
+</launch>
