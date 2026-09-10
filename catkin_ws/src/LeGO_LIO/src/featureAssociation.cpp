@@ -2138,7 +2138,7 @@ public:
         const pcl::PointCloud<PointType> rawSegmentedCloud = *segmentedCloud;
         adjustDistortion();
         estimateGroundPlaneRansac();
-        saveDeskewDebugClouds(deskewFrameCounter, rawSegmentedCloud, *segmentedCloud);
+        // saveDeskewDebugClouds(deskewFrameCounter, rawSegmentedCloud, *segmentedCloud);
 
         calculateSmoothness();
 
