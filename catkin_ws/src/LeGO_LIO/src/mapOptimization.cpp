@@ -13,6 +13,7 @@
 #include "utility.h"
 
 #include <geometry_msgs/Quaternion.h>
+#include <nav_msgs/Path.h>
 #include <sensor_msgs/PointCloud2.h>
 
 #include <Eigen/Eigenvalues>
@@ -159,8 +160,11 @@ private:
 
     ros::Publisher pubLaserCloudSurround_;
     ros::Publisher pubOdomAftMapped_;
+    ros::Publisher pubAftMappedPath_;
     ros::Publisher pubKeyPoses_;
     ros::Publisher pubRegisteredCloud_;
+
+    nav_msgs::Path aftMappedPath_;
 
     ros::Subscriber subLaserCloudCornerLast_;
     ros::Subscriber subLaserCloudSurfLast_;
@@ -246,6 +250,8 @@ public:
         pubKeyPoses_ = nh_.advertise<sensor_msgs::PointCloud2>("/key_pose_origin", 2);
         pubLaserCloudSurround_ = nh_.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surround", 2);
         pubOdomAftMapped_ = nh_.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 5);
+        pubAftMappedPath_ = nh_.advertise<nav_msgs::Path>("/aft_mapped_to_init_path", 2, true);
+        aftMappedPath_.header.frame_id = "map";
         pubRegisteredCloud_ = nh_.advertise<sensor_msgs::PointCloud2>("/registered_cloud", 2);
 
         subLaserCloudCornerLast_ = nh_.subscribe<sensor_msgs::PointCloud2>(
@@ -853,6 +859,13 @@ private:
             transformTobeMapped_[0], transformTobeMapped_[1], transformTobeMapped_[2]);
         odometry.pose.pose.orientation = q;
         pubOdomAftMapped_.publish(odometry);
+
+        geometry_msgs::PoseStamped poseStamped;
+        poseStamped.header = odometry.header;
+        poseStamped.pose = odometry.pose.pose;
+        aftMappedPath_.header = odometry.header;
+        aftMappedPath_.poses.push_back(poseStamped);
+        pubAftMappedPath_.publish(aftMappedPath_);
 
         tf::Transform transform;
         transform.setOrigin(tf::Vector3(pose.translation.x(), pose.translation.y(), pose.translation.z()));
