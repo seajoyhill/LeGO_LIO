@@ -123,7 +123,7 @@ private:
         pnh_.param<double>("runtime/movement_start_distance", movement_start_distance_, 0.05);
         pnh_.param<int>("runtime/minimum_samples_to_solve", minimum_samples_to_solve_, 8);
         pnh_.param<int>("runtime/max_samples", max_samples_, 30000);
-        pnh_.param<int>("calibration/odom_frequency", odom_frequency_, 3);
+        pnh_.param<double>("calibration/odom_frequency", odom_frequency_, 3.0);
         pnh_.param<int>("calibration/cut_frame_num", cut_frame_num_, 1);
         pnh_.param<double>("calibration/mean_acc_norm", mean_acc_norm_, kGravity);
         pnh_.param<double>("calibration/imu_sensor_height", calib_->imu_sensor_height, 0.1);
@@ -477,7 +477,8 @@ private:
         if (accepted_samples_ < static_cast<std::size_t>(minimum_samples_to_solve_)) return;
         solved_ = true;
         try {
-            int odom_freq = odom_frequency_, cut = cut_frame_num_;
+            double odom_freq = odom_frequency_;
+            int cut = cut_frame_num_;
             double time_offset = 0.0;
             calib_->LI_Calibration(odom_freq, cut, time_offset, move_start_time_);
             writeResultFile(reason, true, "batch optimization completed");
@@ -534,7 +535,8 @@ private:
     double frontend_roll_{}, frontend_pitch_{}, frontend_yaw_{}, frontend_tx_{}, frontend_ty_{}, frontend_tz_{};
     Eigen::Matrix3d frontend_R_IL_{Eigen::Matrix3d::Identity()};
     Eigen::Vector3d frontend_t_IL_{Eigen::Vector3d::Zero()};
-    int minimum_samples_to_solve_{}, max_samples_{}, odom_frequency_{}, cut_frame_num_{}, plane_max_iterations_{}, plane_min_inliers_{};
+    int minimum_samples_to_solve_{}, max_samples_{}, cut_frame_num_{}, plane_max_iterations_{}, plane_min_inliers_{};
+    double odom_frequency_{};
     double plane_min_inlier_ratio_{}, plane_distance_threshold_{}, plane_max_rms_{}, plane_max_tilt_deg_{}, plane_voxel_leaf_size_{}, plane_min_range_{}, plane_max_range_{}, plane_min_z_{}, plane_max_z_{};
     double last_imu_stamp_ = 0.0, last_ahrs_stamp_ = 0.0, last_odom_stamp_ = 0.0, move_start_time_ = 0.0;
     V3D initial_position_ = Zero3d;
