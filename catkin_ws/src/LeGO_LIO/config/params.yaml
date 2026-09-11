@@ -23,9 +23,9 @@ lidar_to_imu:
     pitch: 0.0
     yaw: 0.0
   distance:
-    x: 0.27
-    y: 0.0
-    z: 0.20
+    x: 0.00
+    y: 0.00
+    z: 0.00
 
 # Local scan-to-map mapping and keyframe settings.
 mappingProcessInterval: 0.3

@@ -20,19 +20,20 @@ frontend_lidar_to_imu:
   roll: 0.0
   pitch: 0.0
   yaw: 0.0
-  x: 0.27
+  x: 0.0
   y: 0.0
-  z: 0.20
+  z: 0.0
 sync:
-  max_cloud_odom_dt: 0.06
+  max_cloud_odom_dt: 0.12
   max_imu_odom_dt: 0.03
 runtime:
   movement_start_distance: 0.05
   minimum_samples_to_solve: 8
   max_samples: 30000
 calibration:
-  # /aft_mapped_to_init is mapOptimization output (default mappingProcessInterval=0.3 s), not 10 Hz raw LiDAR.
-  odom_frequency: 3
+  # Temporary effective frequency used only by the legacy xcorr index-to-time conversion.
+  # The measured /aft_mapped_to_init interval is about 0.4 s (approximately 2.5 Hz).
+  odom_frequency: 10
   cut_frame_num: 1
   mean_acc_norm: 9.81
   imu_sensor_height: 0.30
@@ -49,7 +50,7 @@ calibration:
   acc_factor: 1.0
   ground_factor: 5.0
   bspline_enable: true
-  bspline_ctrl_points: 50
+  bspline_ctrl_points: 300
   bspline_degree: 3
   bspline_smoothing: 0.0001
 ground_plane:
