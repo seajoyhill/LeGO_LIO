@@ -54,6 +54,7 @@ public:
         imu_sub_ = nh_.subscribe(imu_topic_, 1000, &LeGOCalibNode::imuCallback, this);
         cloud_sub_ = nh_.subscribe(cloud_topic_, 20, &LeGOCalibNode::cloudCallback, this);
         path_pub_ = nh_.advertise<nav_msgs::Path>("/lego_calib/lidar_path", 2, true);
+        bspline_path_pub_ = nh_.advertise<nav_msgs::Path>("/lego_calib/lidar_bspline_path", 2, true);
         plane_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/lego_calib/ground_plane_inliers", 2, true);
 
         path_.header.frame_id = path_frame_id_;
@@ -358,6 +359,18 @@ private:
         have_previous_pose_ = true;
         calib_->push_Lidar_CalibState(q_map_lidar.toRotationMatrix(), position, lidar_omega, Zero3d, stamp);
         calib_->push_Plane_Constraint(q_ground_lidar, imu_orientation->q_ground_to_imu, normal_lidar, lidar_height);
+
+        // Publish an online preview of the fitted curve.  The preview does not
+        // overwrite the raw calibration states; the final batch solve still
+        // performs the authoritative fit and uses the fitted derivatives.
+        const std::size_t next_sample_count = accepted_samples_ + 1;
+        if (calib_->bspline_enable && next_sample_count >= 8 &&
+            (next_sample_count == 8 || next_sample_count % 5 == 0)) {
+            if (calib_->bspline_fit_lidar_kinematics(false))
+                publishBsplinePath();
+            else
+                ROS_WARN_THROTTLE(5.0, "Unable to fit the online LiDAR B-spline path yet.");
+        }
         publishPath(msg->header, msg->pose.pose);
         publishPlane(*inliers, msg->header);
 
@@ -472,6 +485,35 @@ private:
     void publishPlane(const pcl::PointCloud<pcl::PointXYZI>& cloud, const std_msgs::Header& header) {
         sensor_msgs::PointCloud2 msg; pcl::toROSMsg(cloud, msg); msg.header = header; plane_pub_.publish(msg);
     }
+    void publishBsplinePath() {
+        const auto &fitted_states = calib_->get_Lidar_bspline_path();
+        if (fitted_states.empty()) {
+            ROS_WARN("B-spline fitting produced no path samples; /lego_calib/lidar_bspline_path was not published.");
+            return;
+        }
+
+        nav_msgs::Path bspline_path;
+        bspline_path.header.frame_id = path_frame_id_;
+        bspline_path.poses.reserve(fitted_states.size());
+        for (const auto &state : fitted_states) {
+            geometry_msgs::PoseStamped pose;
+            pose.header.frame_id = path_frame_id_;
+            pose.header.stamp = ros::Time(state.timeStamp);
+            pose.pose.position.x = state.pos_end.x();
+            pose.pose.position.y = state.pos_end.y();
+            pose.pose.position.z = state.pos_end.z();
+            const Eigen::Quaterniond q(state.rot_end);
+            pose.pose.orientation.x = q.x();
+            pose.pose.orientation.y = q.y();
+            pose.pose.orientation.z = q.z();
+            pose.pose.orientation.w = q.w();
+            bspline_path.poses.push_back(pose);
+        }
+        bspline_path.header.stamp = bspline_path.poses.back().header.stamp;
+        bspline_path_pub_.publish(bspline_path);
+        ROS_INFO_STREAM("Published fitted LiDAR B-spline path on /lego_calib/lidar_bspline_path with "
+                        << bspline_path.poses.size() << " samples.");
+    }
     void runCalibration(const std::string& reason) {
         if (solved_) return;
         if (accepted_samples_ < static_cast<std::size_t>(minimum_samples_to_solve_)) return;
@@ -481,6 +523,7 @@ private:
             int cut = cut_frame_num_;
             double time_offset = 0.0;
             calib_->LI_Calibration(odom_freq, cut, time_offset, move_start_time_);
+            publishBsplinePath();
             writeResultFile(reason, true, "batch optimization completed");
             ROS_INFO_STREAM("LeGO_Calib result written to " << result_path_);
         } catch (...) { solved_ = false; throw; }
@@ -521,7 +564,7 @@ private:
 
     ros::NodeHandle nh_, pnh_;
     ros::Subscriber odom_sub_, imu_sub_, cloud_sub_;
-    ros::Publisher path_pub_, plane_pub_;
+    ros::Publisher path_pub_, bspline_path_pub_, plane_pub_;
     std::unique_ptr<Gril_Calib> calib_;
     std::mutex mutex_;
     std::deque<TimedCloud> cloud_queue_;
