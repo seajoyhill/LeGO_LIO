@@ -39,11 +39,14 @@ Gril_Calib::Gril_Calib()
 Gril_Calib::~Gril_Calib() = default;
 
 void Gril_Calib::set_IMU_state(const deque<CalibState> &IMU_states) {
-    IMU_state_group.assign(IMU_states.begin(), IMU_states.end() - 1);
+    // Keep every filtered sample.  The old implementation discarded the last
+    // element and later paired the two containers by index; strict timestamp
+    // pairing below no longer needs that truncation.
+    IMU_state_group = IMU_states;
 }
 
 void Gril_Calib::set_Lidar_state(const deque<CalibState> &Lidar_states) {
-    Lidar_state_group.assign(Lidar_states.begin(), Lidar_states.end() - 1);
+    Lidar_state_group = Lidar_states;
 }
 
 void Gril_Calib::set_states_2nd_filter(const deque<CalibState> &IMU_states, const deque<CalibState> &Lidar_states) {
@@ -116,48 +119,134 @@ void Gril_Calib::push_Plane_Constraint(const Eigen::Quaterniond &q_lidar, const 
     distance_Lidar_wrt_ground_group.push_back(distance_lidar);
 }
 
-void Gril_Calib::downsample_interpolate_IMU(const double &move_start_time) {
+bool Gril_Calib::interpolate_state_at_time(const deque<CalibState> &source,
+                                             double timestamp,
+                                             CalibState &state) const {
+    if (source.empty() || !std::isfinite(timestamp)) return false;
+    if (timestamp < source.front().timeStamp || timestamp > source.back().timeStamp)
+        return false;
 
-    while (IMU_state_group_ALL.size() > 2 && IMU_state_group_ALL.front().timeStamp < move_start_time - 3.0)
-        IMU_state_group_ALL.pop_front();
-    while (Lidar_state_group.size() > 2 && Lidar_state_group.front().timeStamp < move_start_time - 3.0)
-        Lidar_state_group.pop_front();
-
-    // Original IMU measurements
-    deque<CalibState> IMU_states_all_origin;
-    IMU_states_all_origin.assign(IMU_state_group_ALL.begin(), IMU_state_group_ALL.end() - 1);
-
-    // Mean filter to attenuate noise
-    int mean_filt_size = 3;
-    for (int i = mean_filt_size; i < IMU_state_group_ALL.size() - mean_filt_size; i++) {
-        V3D acc_real = Zero3d;
-        for (int k = -mean_filt_size; k < mean_filt_size + 1; k++)
-            acc_real += (IMU_states_all_origin[i + k].linear_acc - acc_real) / (k + mean_filt_size + 1);
-        IMU_state_group_ALL[i].linear_acc = acc_real;
+    auto upper = std::lower_bound(
+            source.begin(), source.end(), timestamp,
+            [](const CalibState &sample, double t) { return sample.timeStamp < t; });
+    if (upper == source.begin()) {
+        state = *upper;
+        state.timeStamp = timestamp;
+        return true;
+    }
+    if (upper == source.end()) {
+        state = source.back();
+        state.timeStamp = timestamp;
+        return true;
     }
 
-    // Down-sample and interpolation，Fig.4 in the paper
-    for (int i = 0; i < Lidar_state_group.size(); i++) {
-        for (int j = 1; j < IMU_state_group_ALL.size(); j++) {
-            if (IMU_state_group_ALL[j - 1].timeStamp <= Lidar_state_group[i].timeStamp
-                && IMU_state_group_ALL[j].timeStamp > Lidar_state_group[i].timeStamp) {
-                CalibState IMU_state_interpolation;
-                double delta_t = IMU_state_group_ALL[j].timeStamp - IMU_state_group_ALL[j - 1].timeStamp;
-                double delta_t_right = IMU_state_group_ALL[j].timeStamp - Lidar_state_group[i].timeStamp;
-                double s = delta_t_right / delta_t;
+    const CalibState &right = *upper;
+    const CalibState &left = *(upper - 1);
+    const double dt = right.timeStamp - left.timeStamp;
+    if (!(dt > 0.0)) return false;
+    const double alpha = std::max(0.0, std::min(1.0,
+                         (timestamp - left.timeStamp) / dt));
 
-                IMU_state_interpolation.ang_vel = s * IMU_state_group_ALL[j - 1].ang_vel +
-                                                  (1 - s) * IMU_state_group_ALL[j].ang_vel;
+    state = left;
+    state.rot_end = left.rot_end;
+    state.pos_end = (1.0 - alpha) * left.pos_end + alpha * right.pos_end;
+    state.ang_vel = (1.0 - alpha) * left.ang_vel + alpha * right.ang_vel;
+    state.linear_vel = (1.0 - alpha) * left.linear_vel + alpha * right.linear_vel;
+    state.ang_acc = (1.0 - alpha) * left.ang_acc + alpha * right.ang_acc;
+    state.linear_acc = (1.0 - alpha) * left.linear_acc + alpha * right.linear_acc;
+    state.timeStamp = timestamp;
+    return state.ang_vel.allFinite() && state.linear_acc.allFinite();
+}
 
-                IMU_state_interpolation.linear_acc = s * IMU_state_group_ALL[j - 1].linear_acc +
-                                                     (1 - s) * IMU_state_group_ALL[j].linear_acc;
-                push_IMU_CalibState(IMU_state_interpolation.ang_vel, IMU_state_interpolation.linear_acc,
-                                    Lidar_state_group[i].timeStamp);
-                break;
-            }
+void Gril_Calib::pair_current_imu_to_lidar(double imu_time_shift) {
+    // imu_time_shift follows the calibration convention: if the IMU lags the
+    // LiDAR by +dt, evaluate the IMU signal at t_lidar + dt.  The resulting
+    // state is stamped exactly at t_lidar, so every residual sees a genuinely
+    // timestamp-matched IMU/LiDAR pair rather than two equal-length deques.
+    deque<CalibState> paired_imu;
+    paired_imu.clear();
+
+    deque<CalibState> paired_lidar;
+    deque<Eigen::Quaterniond> paired_lidar_ground;
+    deque<Eigen::Quaterniond> paired_imu_ground;
+    deque<V3D> paired_normals;
+    deque<double> paired_distances;
+
+    const size_t lidar_count = Lidar_state_group.size();
+    const bool have_constraints =
+            Lidar_wrt_ground_group.size() >= lidar_count &&
+            IMU_wrt_ground_group.size() >= lidar_count &&
+            normal_vector_wrt_lidar_group.size() >= lidar_count &&
+            distance_Lidar_wrt_ground_group.size() >= lidar_count;
+
+    size_t rejected = 0;
+    for (size_t i = 0; i < lidar_count; ++i) {
+        const double query_time = Lidar_state_group[i].timeStamp + imu_time_shift;
+        CalibState imu_state;
+        if (!interpolate_state_at_time(IMU_state_group_ALL, query_time, imu_state)) {
+            ++rejected;
+            continue;
+        }
+
+        imu_state.timeStamp = Lidar_state_group[i].timeStamp;
+        paired_imu.push_back(imu_state);
+        paired_lidar.push_back(Lidar_state_group[i]);
+
+        if (have_constraints) {
+            paired_lidar_ground.push_back(Lidar_wrt_ground_group[i]);
+            paired_imu_ground.push_back(IMU_wrt_ground_group[i]);
+            paired_normals.push_back(normal_vector_wrt_lidar_group[i]);
+            paired_distances.push_back(distance_Lidar_wrt_ground_group[i]);
         }
     }
 
+    Lidar_state_group.swap(paired_lidar);
+    IMU_state_group.swap(paired_imu);
+    if (have_constraints) {
+        Lidar_wrt_ground_group.swap(paired_lidar_ground);
+        IMU_wrt_ground_group.swap(paired_imu_ground);
+        normal_vector_wrt_lidar_group.swap(paired_normals);
+        distance_Lidar_wrt_ground_group.swap(paired_distances);
+    }
+
+    if (rejected > 0) {
+        std::cout << "[Timestamp pairing] rejected " << rejected
+                  << " LiDAR samples outside the IMU interpolation range.\n";
+    }
+    if (!IMU_state_group.empty()) {
+        double max_abs_dt = 0.0;
+        for (size_t i = 0; i < IMU_state_group.size(); ++i)
+            max_abs_dt = std::max(max_abs_dt,
+                                  std::abs(IMU_state_group[i].timeStamp -
+                                           Lidar_state_group[i].timeStamp));
+        std::cout << std::fixed << std::setprecision(9)
+                  << "[Timestamp pairing] pairs=" << IMU_state_group.size()
+                  << ", max |t_imu-t_lidar|=" << max_abs_dt << " s"
+                  << ", applied IMU query shift=" << imu_time_shift << " s\n";
+    }
+}
+
+
+void Gril_Calib::downsample_interpolate_IMU(const double &move_start_time) {
+    // Retain the original online windowing, but remove corresponding ground
+    // constraints together with LiDAR poses.  IMU/LiDAR values are paired by
+    // timestamp after filtering, not by container index.
+    while (IMU_state_group_ALL.size() > 2 &&
+           IMU_state_group_ALL.front().timeStamp < move_start_time - 3.0)
+        IMU_state_group_ALL.pop_front();
+
+    while (Lidar_state_group.size() > 2 &&
+           Lidar_state_group.front().timeStamp < move_start_time - 3.0) {
+        Lidar_state_group.pop_front();
+        if (!Lidar_wrt_ground_group.empty()) Lidar_wrt_ground_group.pop_front();
+        if (!IMU_wrt_ground_group.empty()) IMU_wrt_ground_group.pop_front();
+        if (!normal_vector_wrt_lidar_group.empty()) normal_vector_wrt_lidar_group.pop_front();
+        if (!distance_Lidar_wrt_ground_group.empty()) distance_Lidar_wrt_ground_group.pop_front();
+    }
+
+    // Build an initial raw, timestamp-matched sequence for diagnostics.  The
+    // authoritative filtered pairing is rebuilt in LI_Calibration().
+    pair_current_imu_to_lidar(0.0);
 }
 
 namespace {
@@ -408,8 +497,11 @@ bool Gril_Calib::bspline_fit_lidar_kinematics() {
 // Calculates IMU angular acceleration and, when requested, the legacy LiDAR
 // derivatives.  The normal calibration path now passes false for the LiDAR
 // part because those quantities come from bspline_fit_lidar_kinematics().
-void Gril_Calib::central_diff(bool compute_lidar_kinematics) {
-    if (IMU_state_group.size() >= 3) for (size_t i = 1; i + 1 < IMU_state_group.size(); ++i) {
+void Gril_Calib::central_diff(bool compute_lidar_kinematics, bool compute_imu_kinematics) {
+    // IMU angular acceleration must be differentiated in the native-rate
+    // stream.  The paired IMU stream is only about 2.5 Hz and is therefore
+    // not suitable for this derivative.
+    if (compute_imu_kinematics && IMU_state_group.size() >= 3) for (size_t i = 1; i + 1 < IMU_state_group.size(); ++i) {
         const double dt = IMU_state_group[i + 1].timeStamp - IMU_state_group[i - 1].timeStamp;
         if (dt <= 0.0) continue;
         IMU_state_group[i].ang_acc =
@@ -434,7 +526,9 @@ void Gril_Calib::central_diff(bool compute_lidar_kinematics) {
                         << Lidar_state_group[i].ang_vel.norm() << " "
                         << (Lidar_state_group[i].linear_acc - STD_GRAV).transpose() << " "
                         << Lidar_state_group[i].ang_acc.transpose() << " "
-                        << Lidar_state_group[i].timeStamp << endl;
+                        << Lidar_state_group[i].timeStamp << " "
+                        << Lidar_state_group[i].linear_vel.transpose() << " "
+                        << Lidar_state_group[i].linear_vel.norm() << endl;
     }
 }
 
@@ -513,6 +607,10 @@ void Gril_Calib::cut_sequence_tail() {
         for (int i = 0; i < 20; ++i) {
             Lidar_state_group.pop_back();
             IMU_state_group.pop_back();
+            if (!Lidar_wrt_ground_group.empty()) Lidar_wrt_ground_group.pop_back();
+            if (!IMU_wrt_ground_group.empty()) IMU_wrt_ground_group.pop_back();
+            if (!normal_vector_wrt_lidar_group.empty()) normal_vector_wrt_lidar_group.pop_back();
+            if (!distance_Lidar_wrt_ground_group.empty()) distance_Lidar_wrt_ground_group.pop_back();
         }
     }
     if (Lidar_state_group.size() < 2 || IMU_state_group.size() < 2) return;
@@ -527,23 +625,24 @@ void Gril_Calib::cut_sequence_tail() {
 }
 
 void Gril_Calib::acc_interpolate() {
-    //Interpolation to get acc_I(t_L)
-    for (int i = 1; i < Lidar_state_group.size() - 1; i++) {
-        double deltaT = Lidar_state_group[i].timeStamp - IMU_state_group[i].timeStamp;
-        if (deltaT > 0) {
-            double DeltaT = IMU_state_group[i + 1].timeStamp - IMU_state_group[i].timeStamp;
-            double s = deltaT / DeltaT;
-            IMU_state_group[i].linear_acc = s * IMU_state_group[i + 1].linear_acc +
-                                            (1 - s) * IMU_state_group[i].linear_acc;
-            IMU_state_group[i].timeStamp += deltaT;
-        } else {
-            double DeltaT = IMU_state_group[i].timeStamp - IMU_state_group[i - 1].timeStamp;
-            double s = -deltaT / DeltaT;
-            IMU_state_group[i].linear_acc = s * IMU_state_group[i - 1].linear_acc +
-                                            (1 - s) * IMU_state_group[i].linear_acc;
-            IMU_state_group[i].timeStamp += deltaT;
-        }
+    // IMU samples are now interpolated directly at the LiDAR timestamps in
+    // pair_current_imu_to_lidar().  Do not perform the old index-based local
+    // interpolation here; it could silently move only the acceleration while
+    // leaving angular velocity and timestamps inconsistent.
+    if (IMU_state_group.size() != Lidar_state_group.size()) {
+        std::cerr << "[Timestamp pairing] warning: IMU/LiDAR size mismatch at "
+                  << "acc_interpolate(): " << IMU_state_group.size() << " vs "
+                  << Lidar_state_group.size() << std::endl;
+        return;
     }
+    double max_abs_dt = 0.0;
+    for (size_t i = 0; i < IMU_state_group.size(); ++i)
+        max_abs_dt = std::max(max_abs_dt,
+                              std::abs(IMU_state_group[i].timeStamp -
+                                       Lidar_state_group[i].timeStamp));
+    std::cout << std::fixed << std::setprecision(9)
+              << "[Timestamp pairing] final residual alignment max |dt|="
+              << max_abs_dt << " s" << std::endl;
 }
 
 // Butterworth filter (Low-pass filter)
@@ -585,6 +684,9 @@ void Gril_Calib::Butter_filt(const deque<CalibState> &signal_in, deque<CalibStat
             auto it_sig_out = *(sig_out.begin() + i - jj);
             temp_state -= it_sig_out * butter.Coeff_a[jj];
         }
+        // The arithmetic operators combine only kinematic vectors. Preserve
+        // the native sample timestamp explicitly for later interpolation.
+        temp_state.timeStamp = sig_extended[i].timeStamp;
         sig_out[i] = temp_state;
     }
 
@@ -806,8 +908,8 @@ void Gril_Calib::solve_Rot_Trans_calib(double &timediff_imu_wrt_lidar, const dou
 
     time_offset_result = time_delay_IMU_wtr_Lidar;
 
-    //The second temporal compensation
-    IMU_time_compensate(get_lag_time_2(), false);
+    // IMU values used by the solve are already paired at LiDAR timestamps.
+    // Do not mutate the paired timestamps after optimization.
 
     // For debug
     for (size_t i = 0; i < sample_count; i++) {
@@ -960,12 +1062,36 @@ void Gril_Calib::LI_Calibration(int &orig_odom_freq, int &cut_frame_num, double 
         throw std::runtime_error("insufficient temporally overlapping LiDAR/IMU data");
     }
     fout_before_filter();
-    IMU_time_compensate(0.0, true);
 
-    deque<CalibState> IMU_after_zero_phase;
-    zero_phase_filt(get_IMU_state(), IMU_after_zero_phase); // zero phase low-pass filter
-    normalize_acc(IMU_after_zero_phase);
-    set_IMU_state(IMU_after_zero_phase);
+    // Filter the high-rate IMU in its native timestamp domain first.  Then
+    // interpolate the filtered signal at each LiDAR timestamp.  This avoids
+    // the old behavior of filtering a downsampled sequence and aligning two
+    // containers merely because they have the same length.
+    deque<CalibState> filtered_imu_source;
+    zero_phase_filt(IMU_state_group_ALL, filtered_imu_source);
+    normalize_acc(filtered_imu_source);
+    // Compute angular acceleration before resampling.  Previously this was
+    // computed after pairing at the LiDAR rate (~2.5 Hz), which made the
+    // Taylor time-offset residual use a 0.4 s finite-difference derivative.
+    if (filtered_imu_source.size() >= 3) {
+        for (size_t i = 1; i + 1 < filtered_imu_source.size(); ++i) {
+            const double dt = filtered_imu_source[i + 1].timeStamp -
+                              filtered_imu_source[i - 1].timeStamp;
+            if (dt > 0.0) {
+                filtered_imu_source[i].ang_acc =
+                    (filtered_imu_source[i + 1].ang_vel -
+                     filtered_imu_source[i - 1].ang_vel) / dt;
+            }
+        }
+        filtered_imu_source.front().ang_acc = filtered_imu_source[1].ang_acc;
+        filtered_imu_source.back().ang_acc =
+            filtered_imu_source[filtered_imu_source.size() - 2].ang_acc;
+    }
+    IMU_state_group_ALL.swap(filtered_imu_source);
+    pair_current_imu_to_lidar(0.0);
+    if (IMU_state_group.size() < 3 || Lidar_state_group.size() < 3) {
+        throw std::runtime_error("insufficient timestamp-overlapping LiDAR/IMU data after filtering");
+    }
     cut_sequence_tail();
 
     // Fit the actual LiDAR pose sequence before temporal initialization.
@@ -976,15 +1102,22 @@ void Gril_Calib::LI_Calibration(int &orig_odom_freq, int &cut_frame_num, double 
     }
 
     xcorr_temporal_init(orig_odom_freq * cut_frame_num);
-    IMU_time_compensate(get_lag_time_1(), false);
+
+    // Re-sample the already filtered native-rate IMU at the LiDAR timestamps
+    // using the coarse temporal offset.  The state timestamps remain exactly
+    // equal to the LiDAR timestamps, so deltaT in every residual is explicit
+    // and cannot be corrupted by front/back deque trimming.
+    pair_current_imu_to_lidar(get_lag_time_1());
+    if (IMU_state_group.size() < 3 || Lidar_state_group.size() < 3) {
+        throw std::runtime_error("insufficient timestamp-overlapping data after temporal pairing");
+    }
 
     // IMU angular acceleration remains needed by the unified time-offset
     // residual. Preserve B-spline LiDAR kinematics when the fit succeeded.
-    central_diff(!lidar_fit_ok);
-
-    deque<CalibState> IMU_after_2nd_zero_phase;
-    zero_phase_filt(get_IMU_state(), IMU_after_2nd_zero_phase);
-    set_IMU_state(IMU_after_2nd_zero_phase);
+    // LiDAR derivatives come from the B-spline (or the legacy path), while
+    // IMU angular acceleration was already computed at native IMU rate before
+    // timestamp pairing.  Never differentiate the 2.5 Hz paired IMU stream.
+    central_diff(!lidar_fit_ok, false);
     fout_check_lidar(); // file output for visualizing fitted LiDAR kinematics
 
 

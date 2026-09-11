@@ -77,6 +77,7 @@ struct CalibState {
         a.ang_acc = this->ang_acc * coeff;
         a.linear_vel = this->linear_vel * coeff;
         a.linear_acc = this->linear_acc * coeff;
+        a.timeStamp = this->timeStamp;
         return a;
     };
 
@@ -101,6 +102,7 @@ struct CalibState {
         this->ang_acc = b.ang_acc;
         this->linear_vel = b.linear_vel;
         this->linear_acc = b.linear_acc;
+        this->timeStamp = b.timeStamp;
         return *this;
     };
 };
@@ -380,7 +382,7 @@ public:
     bool bspline_fit_lidar_kinematics();
 
     // Kept for backwards compatibility with old callers/debugging.
-    void central_diff(bool compute_lidar_kinematics = true);
+    void central_diff(bool compute_lidar_kinematics = true, bool compute_imu_kinematics = true);
 
     void xcorr_temporal_init(const double &odom_freq);
 
@@ -473,6 +475,14 @@ public:
     }
 
 private:
+    // Interpolate IMU measurements at each LiDAR timestamp.  The calibration
+    // residuals require a one-to-one, timestamp-consistent pair; resizing two
+    // deques and pairing by index is not sufficient for non-uniform odometry.
+    bool interpolate_state_at_time(const deque<CalibState> &source,
+                                   double timestamp,
+                                   CalibState &state) const;
+    void pair_current_imu_to_lidar(double imu_time_shift);
+
     deque<CalibState> IMU_state_group;      // LiDAR와 interpolation을 진행한 IMU data 결과를 가지고 있는 groups
     deque<CalibState> Lidar_state_group;    // LiDAR state 
     deque<CalibState> IMU_state_group_ALL;  // 모든 IMU data (ROS topic)를 가지고 있는 groups
